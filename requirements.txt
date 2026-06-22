@@ -10,3 +10,4 @@ langchain-google-genai>=0.0.3
 langchain-ollama>=0.0.1
 langchain-aws>=0.0.1
 asyncio>=3.4.3 
+requests>=2.31.0

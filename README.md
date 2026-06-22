@@ -5,16 +5,50 @@ This is a local bridge service that enables n8n to communicate with the Browser 
 ## Features
 
 - Compatible with the Browser Use Cloud API endpoints
-- Supports both OpenAI and Anthropic language models
+- Supports OpenAI, Anthropic, Google, Ollama, DeepSeek, Azure OpenAI, and Bedrock providers
 - Provides task management (run, pause, resume, stop)
 - Exposes status tracking and result retrieval
+- Captures browser observations (screenshot + DOM snapshot)
+- Stores per-task trajectory memory for debugging and replay
+- Supports hybrid reward signals (automatic heuristic + manual feedback)
+
+## Architecture Flow
+
+1. Client starts a task with `POST /api/v1/run-task`.
+2. Agent runs in the background and captures step-start screenshots.
+3. For each captured screenshot, the service also stores browser observations:
+   - Current URL
+   - Page title
+   - DOM snapshot (truncated when needed)
+4. The task timeline is saved as a trajectory event stream.
+5. On completion/failure, the service computes an automatic reward score.
+6. Users can submit manual reward feedback via `POST /api/v1/task/{task_id}/reward`.
+7. `GET /api/v1/task/{task_id}` returns task details plus observations, trajectory, and reward.
+
+## Core Concepts
+
+### Web Eye (Observation)
+
+The Web Eye is implemented as structured browser observations that are captured during execution. Each observation includes screenshot linkage and page context, which makes the agent behavior easier to inspect.
+
+### Per-Task Memory
+
+Memory is currently stored as per-task trajectory events (`trajectory`) plus observations (`observations`). This is intentionally simple for the demo-first milestone and avoids introducing database complexity too early.
+
+### Reward Loop
+
+The service now supports a hybrid reward model:
+
+- `auto_score`: heuristic score based on terminal task outcome.
+- `manual_score`: user-provided score for human-in-the-loop correction.
+- `effective_score`: resolved score used for downstream evaluation (manual overrides automatic).
 
 ## Prerequisites
 
 - Python 3.10 or higher
 - pip (Python package manager)
 - Browser Use Python library
-- API keys for OpenAI or Anthropic (depending on which LLM you want to use)
+- API keys for at least one provider (for example OpenAI, Anthropic, or DeepSeek)
 
 ## Installation
 
@@ -37,9 +71,9 @@ This is a local bridge service that enables n8n to communicate with the Browser 
 
 4. Set up environment variables:
    ```bash
-   cp .env-example .env
+   cp .env.example .env
    ```
-   Then edit the `.env` file to add your OpenAI and/or Anthropic API keys.
+   Then edit the `.env` file to add API keys for your chosen provider.
 
 ## Running the Service
 
@@ -62,6 +96,7 @@ This is a local bridge service that enables n8n to communicate with the Browser 
 | PUT    | /api/v1/stop-task/{task_id}        | Stop a running task          |
 | PUT    | /api/v1/pause-task/{task_id}       | Pause a running task         |
 | PUT    | /api/v1/resume-task/{task_id}      | Resume a paused task         |
+| POST   | /api/v1/task/{task_id}/reward      | Submit manual reward score   |
 | GET    | /api/v1/list-tasks                 | List all tasks               |
 | GET    | /live/{task_id}                    | Live view UI                 |
 | GET    | /api/v1/ping                       | Check health                 |
@@ -71,12 +106,62 @@ This is a local bridge service that enables n8n to communicate with the Browser 
 
 ## Usage Examples
 
+### Provider Selection (Important)
+
+You do not pass any provider parameter to `python app.py`.
+
+Provider selection happens in one of two ways:
+
+1. Global default provider from `.env` via `DEFAULT_AI_PROVIDER`
+2. Per-task override in the `POST /api/v1/run-task` body using `ai_provider`
+
+If `ai_provider` is omitted in a request, the server uses `DEFAULT_AI_PROVIDER`.
+
+Set Ollama as default in `.env`:
+
+```env
+DEFAULT_AI_PROVIDER=ollama
+OLLAMA_API_BASE=http://localhost:11434
+OLLAMA_MODEL_ID=lfm2.5:8b
+```
+
+Set DeepSeek as default in `.env`:
+
+```env
+DEFAULT_AI_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your_deepseek_api_key_here
+DEEPSEEK_MODEL_ID=deepseek-chat
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+```
+
+Then start server normally:
+
+```bash
+python app.py
+```
+
 ### Starting a Task
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/run-task \
   -H "Content-Type: application/json" \
   -d '{"task": "Go to google.com and search for n8n automation", "ai_provider": "openai"}'
+```
+
+Use Ollama for a specific task (overrides default):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/run-task \
+   -H "Content-Type: application/json" \
+   -d '{"task": "Open example.com and summarize the page", "ai_provider": "ollama"}'
+```
+
+Use DeepSeek for a specific task (overrides default):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/run-task \
+   -H "Content-Type: application/json" \
+   -d '{"task": "Open example.com and summarize the page", "ai_provider": "deepseek"}'
 ```
 
 ### Checking Task Status
@@ -90,6 +175,26 @@ curl -X GET http://localhost:8000/api/v1/task/{task_id}/status
 ```bash
 curl -X PUT http://localhost:8000/api/v1/stop-task/{task_id}
 ```
+
+### Submitting Manual Reward Feedback
+
+```bash
+curl -X POST http://localhost:8000/api/v1/task/{task_id}/reward \
+   -H "Content-Type: application/json" \
+   -d '{"manual_score": 0.9, "reason": "Task completed accurately"}'
+```
+
+### Inspecting Observation and Reward Data
+
+```bash
+curl -X GET http://localhost:8000/api/v1/task/{task_id}
+```
+
+Look for these fields in the task payload:
+
+- `observations`
+- `trajectory`
+- `reward`
 
 ## Configuration Options
 
@@ -129,6 +234,12 @@ The application supports multiple AI providers. You can specify the provider in 
 - `OLLAMA_API_BASE`: The base URL for your Ollama instance.
 - `OLLAMA_MODEL_ID`: The model to use (e.g., `llama3`).
 
+#### DeepSeek
+
+- `DEEPSEEK_API_KEY`: Your DeepSeek API key.
+- `DEEPSEEK_MODEL_ID`: The model to use (e.g., `deepseek-chat` or `deepseek-reasoner`).
+- `DEEPSEEK_BASE_URL`: DeepSeek compatible API base URL (default: `https://api.deepseek.com/v1`).
+
 #### Azure OpenAI
 
 - `AZURE_API_KEY`: Your Azure OpenAI API key.
@@ -149,12 +260,65 @@ If `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION` are not explic
 
 - `LOG_LEVEL`: Logging level (default: `INFO`).
 - `BROWSER_USE_HEADFUL`: Set to `"true"` to run the browser in headful mode (default: `false`, runs in headless mode).
+- `BROWSER_USE_VISION`: Controls whether image inputs are sent to the model. If unset, the app auto-disables vision for `ollama` and `deepseek`, and enables it for other providers.
+- `TASK_RUN_TIMEOUT_SECONDS`: Maximum task runtime before force stop (default: `120`).
+- `AGENT_MAX_STEPS`: Hard cap for agent reasoning/action steps (default: `8`).
+- `STATUS_TRACK_STEPS_ON_POLL`: If `true`, each status poll appends synthetic progress steps (default: `false`).
+- `STATUS_CAPTURE_SCREENSHOT`: If `true`, status polling can trigger screenshots (default: `false`).
+- `STATUS_SCREENSHOT_MIN_INTERVAL_SECONDS`: Minimum interval between status-triggered screenshots (default: `10`).
+- `AGENT_ENFORCE_CONCISE_EXECUTION`: If `true`, appends execution constraints to reduce repetitive/irrelevant actions (default: `true`).
+- `ENABLE_SIMPLE_TITLE_SHORTCUT`: If `true`, simple “get page title from URL” tasks use a deterministic fast path instead of full autonomous loops (default: `true`).
+- `PASS_SENSITIVE_DATA_TO_AGENT`: If `true`, env vars prefixed with `X_` are passed to the agent as sensitive values (default: `false`).
+- `LOOP_GUARD_MAX_CONSECUTIVE_DUPLICATE_SCREENSHOTS`: Stops a task early when repeated duplicate screenshots indicate no progress (default: `3`).
+- `LOOP_GUARD_MAX_SCREENSHOT_ERRORS`: Stops a task early when screenshot capture repeatedly fails (default: `3`).
 
 ## Troubleshooting
 
 - **ImportError with browser-use**: Make sure you have installed the browser-use package and its dependencies correctly.
 - **API Key Issues**: Verify that your API keys are correctly set in the `.env` file.
 - **Port Conflicts**: If port 8000 is already in use, set a different port in the `.env` file.
+- **`Multimodal data provided, but model does not support multimodal requests`**:
+   - Cause: The selected model is text-only but vision input was sent.
+   - Fix: Set `BROWSER_USE_VISION=false` in `.env` (or use a multimodal model).
+   - For Ollama text-only models such as `lfm2.5:8b`, keep `BROWSER_USE_VISION=false`.
+- **Task seems too slow or loops too long**:
+   - Reduce loop budget with `AGENT_MAX_STEPS=4` to `8`.
+   - Enforce shorter runtime with `TASK_RUN_TIMEOUT_SECONDS=60` to `120`.
+   - Keep status-side overhead low: `STATUS_TRACK_STEPS_ON_POLL=false` and `STATUS_CAPTURE_SCREENSHOT=false`.
+   - Keep `AGENT_ENFORCE_CONCISE_EXECUTION=true` to discourage tool-chatter loops.
+   - Enable early loop stop with `LOOP_GUARD_MAX_CONSECUTIVE_DUPLICATE_SCREENSHOTS=2` to `4`.
+   - Stop unstable browser states with `LOOP_GUARD_MAX_SCREENSHOT_ERRORS=2` to `4`.
+
+- **Agent keeps typing into unrelated fields**:
+   - Keep `PASS_SENSITIVE_DATA_TO_AGENT=false` unless your task specifically needs credential autofill behavior.
+
+## Examples
+
+Runnable examples are available in the `examples/` directory:
+
+- `01_basic_flow.py`: start a task, poll for completion, inspect final payload.
+- `01_advanced_flow.py`: run a multi-step search/watch-page extraction flow and inspect final payload.
+
+See `examples/README.md` for script details and real sample outputs.
+
+Run any example:
+
+```bash
+python examples/01_basic_flow.py --base-url http://localhost:8000
+```
+
+Run example with explicit provider override:
+
+```bash
+python examples/01_basic_flow.py --base-url http://localhost:8000 --provider ollama
+python examples/01_basic_flow.py --base-url http://localhost:8000 --provider deepseek
+```
+
+## Limitations (Current Milestone)
+
+- Storage is in-memory only; task data is lost on process restart.
+- Reward signals are evaluation metadata, not online RL training.
+- Cross-task episodic memory retrieval is not implemented yet.
 
 ## License
 

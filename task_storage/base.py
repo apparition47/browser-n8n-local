@@ -57,6 +57,21 @@ class TaskStorage(ABC):
         pass
 
     @abstractmethod
+    def add_task_observation(self, task_id: str, observation_data: Dict, user_id: str = DEFAULT_USER_ID) -> None:
+        """Add an observation captured from the browser during task execution"""
+        pass
+
+    @abstractmethod
+    def add_task_trajectory_entry(self, task_id: str, trajectory_data: Dict, user_id: str = DEFAULT_USER_ID) -> None:
+        """Add an event entry to a task trajectory"""
+        pass
+
+    @abstractmethod
+    def set_task_reward(self, task_id: str, reward_data: Dict, user_id: str = DEFAULT_USER_ID) -> None:
+        """Set or update reward information for a task"""
+        pass
+
+    @abstractmethod
     def get_task_agent(self, task_id: str, user_id: str = DEFAULT_USER_ID) -> Any:
         """Get the agent instance associated with a task"""
         pass

@@ -14,9 +14,13 @@ def test_api(base_url, task, ai_provider, headful):
     
     # 1. Start a task
     print("\n1. Starting a new task...")
+    payload = {"task": task, "headful": headful}
+    if ai_provider:
+        payload["ai_provider"] = ai_provider
+
     response = requests.post(
         f"{base_url}/api/v1/run-task",
-        json={"task": task, "ai_provider": ai_provider, "headful": headful}
+        json=payload
     )
     
     if response.status_code != 200:
@@ -68,7 +72,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test the Browser Use Bridge API")
     parser.add_argument("--url", default="http://localhost:8000/api/v1", help="Base URL for the API")
     parser.add_argument("--task", default="Go to google.com and search for 'n8n automation'", help="Task to perform")
-    parser.add_argument("--provider", default="openai", choices=["openai", "anthropic", "mistral", "google", "ollama", "azure"], help="AI provider to use")
+    parser.add_argument("--provider", default=None, choices=["openai", "anthropic", "mistral", "google", "ollama", "deepseek", "azure"], help="AI provider override (omit to use server DEFAULT_AI_PROVIDER)")
     parser.add_argument("--headful", action="store_true", help="Run the browser in headful mode")
     args = parser.parse_args()
     sys.exit(test_api(args.url, args.task, args.provider, args.headful)) 

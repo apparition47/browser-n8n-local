@@ -132,6 +132,43 @@ class InMemoryTaskStorage(TaskStorage):
         
         task["media"].append(media_data)
 
+    def add_task_observation(self, task_id: str, observation_data: Dict, user_id: str = DEFAULT_USER_ID) -> None:
+        """Add browser observation data to a task"""
+        if not self.task_exists(task_id, user_id):
+            raise KeyError(f"Task {task_id} not found for user {user_id}")
+
+        task = self._tasks[user_id][task_id]
+
+        if "observations" not in task:
+            task["observations"] = []
+
+        task["observations"].append(observation_data)
+
+    def add_task_trajectory_entry(self, task_id: str, trajectory_data: Dict, user_id: str = DEFAULT_USER_ID) -> None:
+        """Add trajectory event data to a task"""
+        if not self.task_exists(task_id, user_id):
+            raise KeyError(f"Task {task_id} not found for user {user_id}")
+
+        task = self._tasks[user_id][task_id]
+
+        if "trajectory" not in task:
+            task["trajectory"] = []
+
+        task["trajectory"].append(trajectory_data)
+
+    def set_task_reward(self, task_id: str, reward_data: Dict, user_id: str = DEFAULT_USER_ID) -> None:
+        """Set or update reward information for a task"""
+        if not self.task_exists(task_id, user_id):
+            raise KeyError(f"Task {task_id} not found for user {user_id}")
+
+        task = self._tasks[user_id][task_id]
+        current_reward = task.get("reward", {})
+        if not isinstance(current_reward, dict):
+            current_reward = {}
+
+        current_reward.update(reward_data)
+        task["reward"] = current_reward
+
     def get_task_agent(self, task_id: str, user_id: str = DEFAULT_USER_ID) -> Any:
         """Get the agent instance associated with a task"""
         if not self.task_exists(task_id, user_id):

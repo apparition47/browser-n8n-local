@@ -9,6 +9,7 @@ import base64
 import mimetypes
 import signal
 import sys
+import re
 
 from typing import Optional
 from datetime import datetime, UTC
@@ -30,8 +31,8 @@ from langchain_mistralai import ChatMistralAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from langchain_aws import ChatBedrock
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
-from pydantic import BaseModel
+from langchain_openai import AzureChatOpenAI, ChatOpenAI as LCChatOpenAI
+from pydantic import BaseModel, Field
 
 # This import will work once browser-use is installed
 # For development, you may need to add the browser-use repo to your PYTHONPATH
@@ -87,6 +88,34 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("browser-use-bridge")
+
+MAX_DOM_SNAPSHOT_CHARS = int(os.environ.get("MAX_DOM_SNAPSHOT_CHARS", "120000"))
+TASK_RUN_TIMEOUT_SECONDS = int(os.environ.get("TASK_RUN_TIMEOUT_SECONDS", "120"))
+AGENT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "8"))
+STATUS_TRACK_STEPS_ON_POLL = (
+    os.environ.get("STATUS_TRACK_STEPS_ON_POLL", "false").lower() == "true"
+)
+STATUS_CAPTURE_SCREENSHOT = (
+    os.environ.get("STATUS_CAPTURE_SCREENSHOT", "false").lower() == "true"
+)
+STATUS_SCREENSHOT_MIN_INTERVAL_SECONDS = int(
+    os.environ.get("STATUS_SCREENSHOT_MIN_INTERVAL_SECONDS", "10")
+)
+AGENT_ENFORCE_CONCISE_EXECUTION = (
+    os.environ.get("AGENT_ENFORCE_CONCISE_EXECUTION", "true").lower() == "true"
+)
+ENABLE_SIMPLE_TITLE_SHORTCUT = (
+    os.environ.get("ENABLE_SIMPLE_TITLE_SHORTCUT", "true").lower() == "true"
+)
+PASS_SENSITIVE_DATA_TO_AGENT = (
+    os.environ.get("PASS_SENSITIVE_DATA_TO_AGENT", "false").lower() == "true"
+)
+LOOP_GUARD_MAX_CONSECUTIVE_DUPLICATE_SCREENSHOTS = int(
+    os.environ.get("LOOP_GUARD_MAX_CONSECUTIVE_DUPLICATE_SCREENSHOTS", "3")
+)
+LOOP_GUARD_MAX_SCREENSHOT_ERRORS = int(
+    os.environ.get("LOOP_GUARD_MAX_SCREENSHOT_ERRORS", "3")
+)
 
 
 @asynccontextmanager
@@ -179,6 +208,11 @@ class TaskStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
+class RewardRequest(BaseModel):
+    manual_score: float = Field(..., ge=-1.0, le=1.0)
+    reason: Optional[str] = None
+
+
 # Dependency to get user_id from headers
 async def get_user_id(x_user_id: Optional[str] = Header(None)) -> str:
     """Extract user ID from header or use default"""
@@ -200,6 +234,12 @@ def get_llm(ai_provider: str):
         return ChatGoogle(model=os.environ.get("GOOGLE_MODEL_ID", "gemini-1.5-pro"))
     elif ai_provider == "ollama":
         return ChatOllama(model=os.environ.get("OLLAMA_MODEL_ID", "llama3"))
+    elif ai_provider == "deepseek":
+        return LCChatOpenAI(
+            model=os.environ.get("DEEPSEEK_MODEL_ID", "deepseek-chat"),
+            base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+        )
     elif ai_provider == "azure":
         return ChatAzureOpenAI(
             model=os.environ.get("AZURE_MODEL_ID", "gpt-4o"),
@@ -302,11 +342,6 @@ def validate_and_save_screenshot(
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     task = task_storage.get_task(task_id, user_id)
 
-    if task and "steps" in task and task["steps"]:
-        current_step = task["steps"][-1]["step"] - 1
-    else:
-        current_step = "initial"
-
     if task_status == TaskStatus.FINISHED or (
         task and task["status"] == TaskStatus.FINISHED
     ):
@@ -314,6 +349,21 @@ def validate_and_save_screenshot(
     elif task_status == TaskStatus.RUNNING or (
         task and task["status"] == TaskStatus.RUNNING
     ):
+        # Number running status screenshots from 1..n based on existing status-step captures.
+        status_step_count = 0
+
+        if task:
+            for media_entry in task.get("media", []):
+                if not isinstance(media_entry, dict):
+                    continue
+                filename = media_entry.get("filename", "")
+                if isinstance(filename, str) and filename.startswith("status-step-"):
+                    status_step_count += 1
+
+        if status_step_count == 0 and task_media_dir.exists():
+            status_step_count = len(list(task_media_dir.glob("status-step-*.png")))
+
+        current_step = status_step_count + 1
         screenshot_filename = f"status-step-{current_step}-{timestamp}.png"
     else:
         task_status_str = task_status or (task["status"] if task else "unknown")
@@ -412,6 +462,9 @@ def prepare_task_environment(task_id: str, user_id: str):
 
 def get_sensitive_data():
     """Extract sensitive data from environment variables"""
+    if not PASS_SENSITIVE_DATA_TO_AGENT:
+        return {}
+
     sensitive_data = {}
     for key, value in os.environ.items():
         if key.startswith("X_") and value:
@@ -419,14 +472,415 @@ def get_sensitive_data():
     return sensitive_data
 
 
+def resolve_use_vision(ai_provider: str) -> bool:
+    """Resolve vision usage with env override and provider-safe defaults."""
+    configured = os.environ.get("BROWSER_USE_VISION")
+    if configured is not None:
+        return configured.lower() == "true"
+
+    # Safe default for providers/models that are often text-only.
+    if ai_provider in {"ollama", "deepseek"}:
+        return False
+
+    return True
+
+
+def build_agent_task(instruction: str) -> str:
+    """Optionally wrap task with constraints that reduce tool-chatter loops."""
+    json_output_contract = (
+        "Output contract:\n"
+        "- Return the final answer as exactly one valid JSON object (no markdown, no code fences, no extra text).\n"
+        "- Use dynamic keys that fit the task; do not rely on a fixed schema.\n"
+        '- Include a short top-level "summary" string and put detailed values in other JSON fields.\n'
+        '- If a requested value is unavailable, include the key with value null and explain briefly in "summary".\n'
+        "\nCOMPLETION RULE (Critical):\n"
+        "- Once the extract tool (or any tool) returns the requested data, IMMEDIATELY format as JSON and call done().\n"
+        "- Do NOT attempt further browser navigation or tool calls after successful extraction.\n"
+        "- Do NOT loop or retry; successful extraction = task complete."
+    )
+
+    if not AGENT_ENFORCE_CONCISE_EXECUTION:
+        return f"{instruction}\n\n{json_output_contract}"
+
+    guardrails = (
+        "Execution constraints:\n"
+        "- Prefer the shortest path to completion.\n"
+        "- Do not use input_text, write_file, or unrelated actions unless explicitly required by the user task.\n"
+        "- If the requested information is already available, return final answer immediately.\n"
+        "- Avoid repeating the same action pattern after a failed attempt; choose a different strategy or finish with a clear failure reason.\n"
+        "- Keep total actions minimal.\n"
+        "- After any successful extraction (extract tool or find_elements), format result as JSON and call done() immediately—do not continue with more steps."
+    )
+    return f"{instruction}\n\n{guardrails}\n\n{json_output_contract}"
+
+
+def stop_task_for_guardrail(
+    agent,
+    task_id: str,
+    user_id: str,
+    reason: str,
+    event_type: str,
+    event_details: dict,
+):
+    """Stop an active task when a guardrail condition is met."""
+    logger.error(f"Task {task_id} {reason}")
+    task_storage.set_task_error(task_id, reason, user_id)
+    task_storage.update_task_status(task_id, TaskStatus.STOPPING, user_id)
+    add_trajectory_event(task_id, user_id, event_type, event_details)
+
+    try:
+        agent.stop()
+    except Exception as stop_error:
+        logger.warning(f"Failed to stop agent after guardrail trigger: {stop_error}")
+
+
+async def check_extraction_complete(
+    agent,
+    task_id: str,
+    user_id: str,
+    initial_extracted_count: int = 0,
+) -> bool:
+    """Stop only when *new* extracted content appears after task start.
+
+    Some browser-use versions may have non-empty extracted history at initialization,
+    so we compare against an initial baseline to avoid premature stop on step 1.
+    """
+    if not hasattr(agent, "history") or agent.history is None:
+        return False
+
+    try:
+        extracted_items = agent.history.extracted_content()
+        if not extracted_items:
+            return False
+
+        # Filter out empty/error artifacts
+        meaningful = [
+            item
+            for item in extracted_items
+            if item and not is_unhelpful_output(str(item))
+        ]
+        if not meaningful:
+            return False
+
+        latest_output = str(meaningful[-1])
+        if not is_high_confidence_extraction_output(latest_output):
+            logger.debug(
+                f"Task {task_id}: latest extracted item is not a high-confidence final extraction signal; continuing"
+            )
+            return False
+
+        new_item_count = len(meaningful) - max(0, initial_extracted_count)
+        if new_item_count <= 0:
+            return False
+
+        logger.info(
+            f"Task {task_id}: extraction complete with {new_item_count} new result(s), stopping agent to avoid unnecessary LLM calls"
+        )
+
+        # Capture final screenshot and format result in parallel (while agent is still active)
+        try:
+            results = await asyncio.gather(
+                capture_screenshot(agent, task_id, user_id),
+                format_extraction_result_with_llm(
+                    latest_output, getattr(agent, "llm", None), task_id, user_id
+                ),
+                return_exceptions=True,
+            )
+            # results[1] is the formatted output from LLM
+            clean_output = (
+                results[1]
+                if isinstance(results[1], str)
+                else extract_result_from_wrapper(latest_output)
+            )
+        except Exception as e:
+            logger.debug(f"Error in parallel extraction formatting: {e}")
+            clean_output = extract_result_from_wrapper(latest_output)
+
+        task_storage.set_task_output(task_id, clean_output, user_id)
+        add_trajectory_event(
+            task_id,
+            user_id,
+            "extraction_auto_stop",
+            {
+                "extracted_items_count": len(meaningful),
+                "initial_extracted_count": initial_extracted_count,
+                "new_extracted_items_count": new_item_count,
+            },
+        )
+        agent.stop()
+        return True
+    except Exception as e:
+        logger.debug(f"check_extraction_complete error for task {task_id}: {e}")
+        return False
+
+
+def extract_first_url(text: str) -> Optional[str]:
+    """Extract the first URL from a task instruction."""
+    match = re.search(r"https?://[^\s)\]]+", text)
+    if not match:
+        return None
+    return match.group(0).rstrip(".,")
+
+
+def is_unhelpful_output(output: Optional[str]) -> bool:
+    """Determine whether model output is empty or clearly a tool-error artifact."""
+    if not output:
+        return True
+
+    normalized = output.strip().lower()
+    if not normalized:
+        return True
+
+    noisy_markers = [
+        "file '",
+        "not found",
+        "error executing action",
+        "action '",
+    ]
+    return any(marker in normalized for marker in noisy_markers)
+
+
+async def format_extraction_result_with_llm(
+    raw_output: str,
+    llm,
+    task_id: str,
+    user_id: str,
+) -> str:
+    """Format extracted result as structured JSON with summary and raw_data sections."""
+    if not llm or not raw_output:
+        return extract_result_from_wrapper(raw_output)
+
+    prompt = """You are a data extraction formatter. Parse the following extracted information and return ONLY a valid JSON object with:
+1. "summary": A brief 1-2 sentence summary of key findings
+2. "structured_data": An object with clearly named fields for each value
+3. "raw_data": The original extraction preserved exactly as provided
+
+Return ONLY valid JSON, no markdown, no code fences.
+
+Extracted information:
+""" + raw_output
+
+    try:
+        from langchain_core.messages import HumanMessage
+
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        result_text = response.content if hasattr(response, "content") else str(response)
+
+        try:
+            parsed = json.loads(result_text)
+            return json.dumps(parsed, indent=2)
+        except json.JSONDecodeError:
+            json_match = re.search(r"\{.*\}", result_text, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group(0))
+                return json.dumps(parsed, indent=2)
+            return result_text
+    except Exception as e:
+        logger.debug(
+            f"LLM formatting failed for task {task_id}, falling back: {e}"
+        )
+        return extract_result_from_wrapper(raw_output)
+
+
+def extract_result_from_wrapper(raw_output: str) -> str:
+    """Extract clean result content from tool wrapper XML.
+
+    If output contains <result>...</result>, extract that.
+    Otherwise return the input as-is.
+    """
+    if not raw_output:
+        return raw_output
+
+    result_match = re.search(
+        r"<result>(.*?)</result>", raw_output, flags=re.IGNORECASE | re.DOTALL
+    )
+    if result_match:
+        content = result_match.group(1).strip()
+        if content.startswith("{") and content.endswith("}"):
+            try:
+                parsed = json.loads(content)
+                return json.dumps(parsed, indent=2)
+            except json.JSONDecodeError:
+                pass
+        return content
+    return raw_output
+
+
+def is_high_confidence_extraction_output(output: Optional[str]) -> bool:
+    """Return True only for outputs that look like final extracted answers.
+
+    This rejects common action/tool chatter (for example go_to_url navigation
+    responses) so step-start guardrails do not stop tasks prematurely.
+    """
+    if not output:
+        return False
+
+    text = output.strip()
+    if not text:
+        return False
+
+    normalized = text.lower()
+
+    # Strong signal from extract_structured_data tool payload shape.
+    if "<result>" in normalized and "</result>" in normalized:
+        return True
+
+    # Accept explicit JSON-shaped final answers.
+    if text.startswith("{") and text.endswith("}"):
+        return True
+
+    # Reject common navigation/action artifacts.
+    action_markers = [
+        "navigated to",
+        "go_to_url",
+        "clicked",
+        "typing",
+        "typed",
+        "scroll",
+        "opened",
+        "new tab",
+        "switched tab",
+    ]
+    if any(marker in normalized for marker in action_markers):
+        return False
+
+    return False
+
+
+async def try_simple_title_shortcut(
+    agent,
+    instruction: str,
+    task_id: str,
+    user_id: str,
+) -> Optional[str]:
+    """Handle simple title-extraction tasks with deterministic browser operations."""
+    if not ENABLE_SIMPLE_TITLE_SHORTCUT:
+        return None
+
+    instruction_lc = instruction.lower()
+    if "title" not in instruction_lc:
+        return None
+
+    target_url = extract_first_url(instruction)
+    if not target_url:
+        return None
+
+    try:
+        title = None
+        observation = None
+
+        if hasattr(agent, "browser_session") and agent.browser_session is not None:
+            # Browser session already initialized – use it directly.
+            await agent.browser_session.navigate_to(target_url)
+            observation = await collect_browser_observation(agent)
+            if observation:
+                title = observation.get("title")
+
+                if not title:
+                    dom_html = observation.get("dom_html") or ""
+                    if dom_html:
+                        title_match = re.search(
+                            r"<title[^>]*>(.*?)</title>",
+                            dom_html,
+                            flags=re.IGNORECASE | re.DOTALL,
+                        )
+                        if title_match:
+                            title = title_match.group(1).strip() or None
+
+                    if not title and dom_html:
+                        h1_match = re.search(
+                            r"<h1[^>]*>(.*?)</h1>",
+                            dom_html,
+                            flags=re.IGNORECASE | re.DOTALL,
+                        )
+                        if h1_match:
+                            title = h1_match.group(1).strip() or None
+        else:
+            # Browser session not yet initialized (pre-run).  Use a lightweight
+            # HTTP fetch so simple title tasks complete without invoking the LLM.
+            import urllib.request as _urllib_req
+
+            def _fetch_html(url: str) -> str:
+                req = _urllib_req.Request(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; browser-use-bridge/1.0)"
+                    },
+                )
+                with _urllib_req.urlopen(req, timeout=10) as resp:
+                    charset = resp.info().get_content_charset() or "utf-8"
+                    content = resp.read().decode(charset, errors="replace")
+                    return content[:MAX_DOM_SNAPSHOT_CHARS]
+
+            try:
+                dom_html = await asyncio.to_thread(_fetch_html, target_url)
+            except Exception as fetch_error:
+                logger.warning(
+                    f"HTTP title shortcut fetch failed for {target_url}: {fetch_error}"
+                )
+                return None
+
+            title_match = re.search(
+                r"<title[^>]*>(.*?)</title>", dom_html, flags=re.IGNORECASE | re.DOTALL
+            )
+            if title_match:
+                title = title_match.group(1).strip() or None
+
+            if not title:
+                h1_match = re.search(
+                    r"<h1[^>]*>(.*?)</h1>", dom_html, flags=re.IGNORECASE | re.DOTALL
+                )
+                if h1_match:
+                    title = h1_match.group(1).strip() or None
+
+            observation = {
+                "url": target_url,
+                "title": title,
+                "dom_html": dom_html,
+                "dom_truncated": len(dom_html) >= MAX_DOM_SNAPSHOT_CHARS,
+            }
+
+        if observation:
+            observation_entry = {
+                "observation_id": 1,
+                "step": 1,
+                "source": "shortcut_title",
+                "timestamp": datetime.now(UTC).isoformat() + "Z",
+                "screenshot_url": None,
+                **observation,
+            }
+            task_storage.add_task_observation(task_id, observation_entry, user_id)
+
+        add_trajectory_event(
+            task_id,
+            user_id,
+            "shortcut_title",
+            {"url": target_url, "success": bool(title)},
+        )
+
+        if title:
+            return f"Page title: {title}"
+        return f"No page title found at {target_url}."
+    except Exception as shortcut_error:
+        logger.warning(
+            f"Simple title shortcut failed for task {task_id}: {shortcut_error}"
+        )
+        return None
+
+
 def create_agent_config(
-    instruction: str, llm, sensitive_data: dict, browser: Optional[Browser] = None
+    instruction: str,
+    llm,
+    sensitive_data: dict,
+    ai_provider: str,
+    browser: Optional[Browser] = None,
 ):
     """Create agent configuration dictionary"""
     agent_kwargs = {
-        "task": instruction,
+        "task": build_agent_task(instruction),
         "llm": llm,
         "sensitive_data": sensitive_data,
+        "use_vision": resolve_use_vision(ai_provider),
     }
 
     if browser:
@@ -435,13 +889,187 @@ def create_agent_config(
     return agent_kwargs
 
 
+def add_trajectory_event(task_id: str, user_id: str, event_type: str, details: dict):
+    """Append a normalized trajectory event for later inspection."""
+    event = {
+        "timestamp": datetime.now(UTC).isoformat() + "Z",
+        "event_type": event_type,
+        "details": details,
+    }
+    task_storage.add_task_trajectory_entry(task_id, event, user_id)
+
+
+def compute_auto_reward(task: Optional[dict]) -> tuple[float, str]:
+    """Compute a simple transparent heuristic reward for demo usage."""
+    if not task:
+        return 0.0, "no task context available"
+
+    status = task.get("status")
+    output = task.get("output")
+    error = task.get("error")
+
+    if status == TaskStatus.FINISHED and output:
+        return 0.8, "task finished with non-empty output"
+    if status == TaskStatus.FINISHED:
+        return 0.4, "task finished without output"
+    if status in [TaskStatus.STOPPED, TaskStatus.STOPPING]:
+        return -0.2, "task was stopped before completion"
+    if status == TaskStatus.FAILED or error:
+        return -0.8, "task failed or produced an error"
+
+    return 0.0, "task is non-terminal or lacks clear success signal"
+
+
+async def collect_browser_observation(agent) -> Optional[dict]:
+    """Capture a lightweight browser state snapshot, including DOM content."""
+    if not hasattr(agent, "browser_session") or agent.browser_session is None:
+        return None
+
+    browser_session = agent.browser_session
+    page = None
+    observation = {
+        "url": None,
+        "title": None,
+        "dom_html": None,
+        "dom_truncated": False,
+    }
+
+    try:
+        if hasattr(browser_session, "get_current_page"):
+            page = await browser_session.get_current_page()
+    except Exception as page_error:
+        logger.debug(f"Unable to get current page from browser session: {page_error}")
+
+    if page is not None:
+        try:
+            observation["url"] = getattr(page, "url", None)
+        except Exception:
+            observation["url"] = None
+
+        try:
+            if hasattr(page, "title"):
+                observation["title"] = await page.title()
+        except Exception as title_error:
+            logger.debug(f"Unable to capture page title: {title_error}")
+
+        try:
+            if hasattr(page, "content"):
+                dom_html = await page.content()
+                if dom_html and len(dom_html) > MAX_DOM_SNAPSHOT_CHARS:
+                    dom_html = dom_html[:MAX_DOM_SNAPSHOT_CHARS]
+                    observation["dom_truncated"] = True
+                observation["dom_html"] = dom_html
+        except Exception as dom_error:
+            logger.debug(f"Unable to capture page DOM: {dom_error}")
+
+    if not observation["url"] and hasattr(browser_session, "current_url"):
+        try:
+            observation["url"] = browser_session.current_url
+        except Exception:
+            observation["url"] = None
+
+    has_signal = any(
+        [observation["url"], observation["title"], observation["dom_html"]]
+    )
+    return observation if has_signal else None
+
+
+async def record_task_observation(
+    agent,
+    task_id: str,
+    user_id: str,
+    screenshot_url: Optional[str],
+    source: str,
+):
+    """Persist a browser observation and corresponding trajectory event."""
+    observation = await collect_browser_observation(agent)
+    if not observation:
+        return
+
+    task = task_storage.get_task(task_id, user_id) or {}
+    observation_index = len(task.get("observations", [])) + 1
+    task_step_count = len(task.get("steps", []))
+
+    observation_entry = {
+        "observation_id": observation_index,
+        "step": task_step_count,
+        "source": source,
+        "timestamp": datetime.now(UTC).isoformat() + "Z",
+        "screenshot_url": screenshot_url,
+        **observation,
+    }
+    task_storage.add_task_observation(task_id, observation_entry, user_id)
+    add_trajectory_event(
+        task_id,
+        user_id,
+        "observation",
+        {
+            "observation_id": observation_index,
+            "step": task_step_count,
+            "source": source,
+            "url": observation_entry.get("url"),
+            "screenshot_url": screenshot_url,
+            "dom_truncated": observation_entry.get("dom_truncated", False),
+        },
+    )
+
+
 async def process_task_result(result, task_id: str, user_id: str):
     """Process and store task execution result"""
     if isinstance(result, AgentHistoryList):
         final_result = result.final_result()
-        task_storage.set_task_output(task_id, final_result or "", user_id)
+        if final_result:
+            task_storage.set_task_output(task_id, str(final_result), user_id)
+            return
+
+        # Fallback: if model failed to emit done(), use the latest extracted content
+        # captured from successful tool actions.
+        extracted_items = result.extracted_content()
+        if extracted_items:
+            task_storage.set_task_output(task_id, str(extracted_items[-1]), user_id)
+        else:
+            task_storage.set_task_output(task_id, "", user_id)
     else:
         task_storage.set_task_output(task_id, str(result), user_id)
+
+
+def infer_output_from_observations(task: Optional[dict]) -> Optional[str]:
+    """Best-effort summary when model did not emit a final answer."""
+    if not task:
+        return None
+
+    if task.get("output"):
+        return None
+
+    observations = task.get("observations", [])
+    if not observations:
+        return None
+
+    for observation in reversed(observations):
+        dom_html = observation.get("dom_html") or ""
+
+        title = observation.get("title")
+        if title:
+            return f"Page title: {title}"
+
+        if dom_html:
+            title_match = re.search(
+                r"<title[^>]*>(.*?)</title>", dom_html, flags=re.IGNORECASE | re.DOTALL
+            )
+            if title_match and title_match.group(1).strip():
+                return f"Page title: {title_match.group(1).strip()}"
+
+            h1_match = re.search(
+                r"<h1[^>]*>(.*?)</h1>", dom_html, flags=re.IGNORECASE | re.DOTALL
+            )
+            if h1_match and h1_match.group(1).strip():
+                return f"Page heading: {h1_match.group(1).strip()}"
+
+    latest_url = observations[-1].get("url")
+    if latest_url:
+        return f"No final model output was returned. Last observed URL: {latest_url}"
+
+    return "No final model output was returned."
 
 
 async def collect_browser_cookies(agent, task_id: str, user_id: str):
@@ -495,7 +1123,12 @@ async def cleanup_task(browser: Optional[Browser], task_id: str, user_id: str):
         finally:
             if browser:
                 try:
-                    await browser.close()
+                    if hasattr(browser, "close"):
+                        await browser.close()
+                    else:
+                        logger.info(
+                            f"Browser object for task {task_id} has no close() method; skipping explicit browser close"
+                        )
                 except Exception as e:
                     logger.error(f"Error closing browser for task {task_id}: {str(e)}")
 
@@ -521,34 +1154,275 @@ async def execute_task(
 
         # Set up LLM and browser
         llm = get_llm(ai_provider)
+        logger.info(
+            f"Task {task_id}: Using ai_provider={ai_provider}, llm_class={llm.__class__.__name__}"
+        )
         browser, browser_info = configure_browser_profile(task_browser_config)
         logger.info(f"Task {task_id}: Browser configuration: {browser_info}")
 
         # Create agent
         sensitive_data = get_sensitive_data()
-        agent_config = create_agent_config(instruction, llm, sensitive_data, browser)
+        agent_config = create_agent_config(
+            instruction,
+            llm,
+            sensitive_data,
+            ai_provider,
+            browser,
+        )
         logger.info(f"Agent config keys: {list(agent_config.keys())}")
 
-        agent = Agent(**agent_config)
+        try:
+            agent = Agent(**agent_config)
+        except TypeError as type_error:
+            if "use_vision" in str(type_error):
+                logger.warning(
+                    "Agent constructor does not support use_vision on this browser-use version; retrying without it"
+                )
+                agent_config.pop("use_vision", None)
+                agent = Agent(**agent_config)
+            else:
+                raise
         task_storage.set_task_agent(task_id, agent, user_id)
 
-        # Execute task with automated screenshots
-        result = await agent.run(
-            on_step_start=lambda agent_instance: asyncio.create_task(
-                automated_screenshot(agent_instance, task_id, user_id)
+        initial_extracted_count = 0
+        try:
+            if hasattr(agent, "history") and agent.history is not None:
+                initial_extracted_count = len(agent.history.extracted_content() or [])
+        except Exception as history_error:
+            logger.debug(
+                f"Unable to read initial extracted history for task {task_id}: {history_error}"
             )
+
+        shortcut_output = await try_simple_title_shortcut(
+            agent,
+            instruction,
+            task_id,
+            user_id,
         )
+        if shortcut_output:
+            task_storage.set_task_output(
+                task_id,
+                shortcut_output,
+                user_id,
+            )
+            task_storage.mark_task_finished(task_id, user_id, TaskStatus.FINISHED)
+            finished_task = task_storage.get_task(task_id, user_id)
+            auto_score, auto_reason = compute_auto_reward(finished_task)
+            task_storage.set_task_reward(
+                task_id,
+                {
+                    "auto_score": auto_score,
+                    "effective_score": auto_score,
+                    "source": "auto",
+                    "reason": auto_reason,
+                    "updated_at": datetime.now(UTC).isoformat() + "Z",
+                },
+                user_id,
+            )
+            add_trajectory_event(
+                task_id,
+                user_id,
+                "reward_auto",
+                {"score": auto_score, "reason": auto_reason},
+            )
+            await collect_browser_cookies(agent, task_id, user_id)
+            return
+
+        # Execute task with automated screenshots and guardrails
+        async def _on_step_start(agent_instance):
+            """Capture screenshots at the beginning of each step."""
+            await automated_screenshot(agent_instance, task_id, user_id)
+
+        async def _on_step_end(agent_instance):
+            """Stop only after a completed step once extraction is confidently done."""
+            await check_extraction_complete(
+                agent_instance,
+                task_id,
+                user_id,
+                initial_extracted_count=initial_extracted_count,
+            )
+
+        run_kwargs = {
+            "on_step_start": lambda agent_instance: asyncio.create_task(
+                _on_step_start(agent_instance)
+            ),
+            "on_step_end": lambda agent_instance: asyncio.create_task(
+                _on_step_end(agent_instance)
+            ),
+        }
+        if AGENT_MAX_STEPS > 0:
+            run_kwargs["max_steps"] = AGENT_MAX_STEPS
+
+        while True:
+            try:
+                run_coro = agent.run(**run_kwargs)
+                break
+            except TypeError as run_type_error:
+                error_text = str(run_type_error)
+                if "on_step_end" in error_text and "on_step_end" in run_kwargs:
+                    logger.warning(
+                        "agent.run() does not support on_step_end on this browser-use version; retrying without it"
+                    )
+                    run_kwargs.pop("on_step_end", None)
+                    continue
+                if "max_steps" in error_text and "max_steps" in run_kwargs:
+                    logger.warning(
+                        "agent.run() does not support max_steps on this browser-use version; retrying without it"
+                    )
+                    run_kwargs.pop("max_steps", None)
+                    continue
+                raise
+
+        if TASK_RUN_TIMEOUT_SECONDS > 0:
+            result = await asyncio.wait_for(run_coro, timeout=TASK_RUN_TIMEOUT_SECONDS)
+        else:
+            result = await run_coro
 
         # Process results
-        task_storage.mark_task_finished(task_id, user_id, TaskStatus.FINISHED)
         await process_task_result(result, task_id, user_id)
+        post_run_task = task_storage.get_task(task_id, user_id)
+        inferred_output = infer_output_from_observations(post_run_task)
+        if inferred_output and is_unhelpful_output((post_run_task or {}).get("output")):
+            task_storage.set_task_output(
+                task_id,
+                inferred_output,
+                user_id,
+            )
+
+        post_run_status = (post_run_task or {}).get("status")
+        if post_run_status in [TaskStatus.STOPPING, TaskStatus.STOPPED]:
+            task_storage.mark_task_finished(task_id, user_id, TaskStatus.STOPPED)
+        else:
+            task_storage.mark_task_finished(task_id, user_id, TaskStatus.FINISHED)
+
+        finished_task = task_storage.get_task(task_id, user_id)
+        auto_score, auto_reason = compute_auto_reward(finished_task)
+        task_storage.set_task_reward(
+            task_id,
+            {
+                "auto_score": auto_score,
+                "effective_score": auto_score,
+                "source": "auto",
+                "reason": auto_reason,
+                "updated_at": datetime.now(UTC).isoformat() + "Z",
+            },
+            user_id,
+        )
+        add_trajectory_event(
+            task_id,
+            user_id,
+            "reward_auto",
+            {"score": auto_score, "reason": auto_reason},
+        )
         await collect_browser_cookies(agent, task_id, user_id)
 
     except Exception as e:
+        if isinstance(e, asyncio.TimeoutError):
+            logger.error(
+                f"Task {task_id} timed out after {TASK_RUN_TIMEOUT_SECONDS}s; stopping task"
+            )
+            agent = task_storage.get_task_agent(task_id, user_id)
+            timeout_extracted_output = None
+
+            # Prefer already-extracted content from agent history when available.
+            try:
+                if agent and hasattr(agent, "history") and agent.history is not None:
+                    extracted_items = agent.history.extracted_content()
+                    if extracted_items:
+                        timeout_extracted_output = str(extracted_items[-1])
+            except Exception as history_error:
+                logger.debug(
+                    f"Could not read extracted content from history for task {task_id}: {history_error}"
+                )
+
+            if agent:
+                try:
+                    agent.stop()
+                except Exception as stop_error:
+                    logger.warning(f"Failed to stop timed out agent: {stop_error}")
+
+            timed_out_task = task_storage.get_task(task_id, user_id)
+            inferred_output = (
+                timeout_extracted_output
+                or infer_output_from_observations(timed_out_task)
+            )
+            if inferred_output and is_unhelpful_output(
+                (timed_out_task or {}).get("output")
+            ):
+                output_to_store = inferred_output
+                task_storage.set_task_output(task_id, output_to_store, user_id)
+
+            timed_out_task = task_storage.get_task(task_id, user_id)
+            has_useful_output = not is_unhelpful_output(
+                (timed_out_task or {}).get("output")
+            )
+
+            if has_useful_output:
+                # If we recovered meaningful output before timeout, finalize as success.
+                task_storage.update_task(task_id, {"error": None}, user_id)
+                task_storage.mark_task_finished(task_id, user_id, TaskStatus.FINISHED)
+                add_trajectory_event(
+                    task_id,
+                    user_id,
+                    "timeout_recovered",
+                    {
+                        "timeout_seconds": TASK_RUN_TIMEOUT_SECONDS,
+                        "status": TaskStatus.FINISHED,
+                    },
+                )
+            else:
+                task_storage.update_task_status(task_id, TaskStatus.STOPPED, user_id)
+                task_storage.set_task_error(
+                    task_id,
+                    f"Task timed out after {TASK_RUN_TIMEOUT_SECONDS} seconds",
+                    user_id,
+                )
+                task_storage.mark_task_finished(task_id, user_id, TaskStatus.STOPPED)
+
+            timed_out_task = task_storage.get_task(task_id, user_id)
+            auto_score, auto_reason = compute_auto_reward(timed_out_task)
+            task_storage.set_task_reward(
+                task_id,
+                {
+                    "auto_score": auto_score,
+                    "effective_score": auto_score,
+                    "source": "auto",
+                    "reason": auto_reason,
+                    "updated_at": datetime.now(UTC).isoformat() + "Z",
+                },
+                user_id,
+            )
+            add_trajectory_event(
+                task_id,
+                user_id,
+                "reward_auto",
+                {"score": auto_score, "reason": auto_reason},
+            )
+            return
+
         logger.exception(f"Error executing task {task_id}")
         task_storage.update_task_status(task_id, TaskStatus.FAILED, user_id)
         task_storage.set_task_error(task_id, str(e), user_id)
         task_storage.mark_task_finished(task_id, user_id, TaskStatus.FAILED)
+        failed_task = task_storage.get_task(task_id, user_id)
+        auto_score, auto_reason = compute_auto_reward(failed_task)
+        task_storage.set_task_reward(
+            task_id,
+            {
+                "auto_score": auto_score,
+                "effective_score": auto_score,
+                "source": "auto",
+                "reason": auto_reason,
+                "updated_at": datetime.now(UTC).isoformat() + "Z",
+            },
+            user_id,
+        )
+        add_trajectory_event(
+            task_id,
+            user_id,
+            "reward_auto",
+            {"score": auto_score, "reason": auto_reason},
+        )
     finally:
         await cleanup_task(browser, task_id, user_id)
 
@@ -574,6 +1448,16 @@ async def run_task(request: TaskRequest, user_id: str = Depends(get_user_id)):
         "output": None,  # Final result
         "error": None,
         "steps": [],  # Will store step information
+        "observations": [],  # Browser snapshots captured during execution
+        "trajectory": [],  # Timeline of observation and reward events
+        "reward": {
+            "auto_score": None,
+            "manual_score": None,
+            "effective_score": None,
+            "source": None,
+            "reason": None,
+            "updated_at": None,
+        },
         "agent": None,
         "save_browser_data": request.save_browser_data,
         "browser_data": None,  # Will store browser cookies if requested
@@ -582,6 +1466,9 @@ async def run_task(request: TaskRequest, user_id: str = Depends(get_user_id)):
             "headful": request.headful,
             "use_custom_chrome": request.use_custom_chrome,
         },
+        "last_status_capture_epoch": None,
+        "consecutive_duplicate_screenshots": 0,
+        "screenshot_error_count": 0,
         "live_url": live_url,
     }
 
@@ -617,6 +1504,32 @@ async def automated_screenshot(agent, task_id, user_id=DEFAULT_USER_ID):
             logger.error(
                 f"Failed to take screenshot for task {task_id}: {screenshot_error}"
             )
+
+            task = task_storage.get_task(task_id, user_id) or {}
+            screenshot_error_count = int(task.get("screenshot_error_count", 0)) + 1
+            task_storage.update_task(
+                task_id,
+                {"screenshot_error_count": screenshot_error_count},
+                user_id,
+            )
+
+            if (
+                LOOP_GUARD_MAX_SCREENSHOT_ERRORS > 0
+                and screenshot_error_count >= LOOP_GUARD_MAX_SCREENSHOT_ERRORS
+            ):
+                stop_task_for_guardrail(
+                    agent,
+                    task_id,
+                    user_id,
+                    reason=(
+                        "loop guard triggered: repeated screenshot capture errors indicate unstable page state"
+                    ),
+                    event_type="loop_guard",
+                    event_details={
+                        "screenshot_errors": screenshot_error_count,
+                        "error": str(screenshot_error),
+                    },
+                )
             return
 
         # Process screenshot data
@@ -628,14 +1541,59 @@ async def automated_screenshot(agent, task_id, user_id=DEFAULT_USER_ID):
         # Check for duplicates
         if check_duplicate_screenshot(image_data, task_id):
             logger.info(f"Skipping duplicate screenshot for task {task_id}")
+            task = task_storage.get_task(task_id, user_id) or {}
+            duplicate_count = int(task.get("consecutive_duplicate_screenshots", 0)) + 1
+            task_storage.update_task(
+                task_id,
+                {"consecutive_duplicate_screenshots": duplicate_count},
+                user_id,
+            )
+
+            if (
+                LOOP_GUARD_MAX_CONSECUTIVE_DUPLICATE_SCREENSHOTS > 0
+                and duplicate_count >= LOOP_GUARD_MAX_CONSECUTIVE_DUPLICATE_SCREENSHOTS
+            ):
+                stop_task_for_guardrail(
+                    agent,
+                    task_id,
+                    user_id,
+                    reason=(
+                        "loop guard triggered: repeated duplicate screenshots suggest no progress"
+                    ),
+                    event_type="loop_guard",
+                    event_details={
+                        "duplicate_screenshots": duplicate_count,
+                        "reason": "repeated duplicate screenshots suggest no progress",
+                    },
+                )
+                add_trajectory_event(
+                    task_id,
+                    user_id,
+                    "loop_guard_metrics",
+                    {"duplicate_screenshots": duplicate_count},
+                )
             return
 
         logger.info(f"Taking screenshot for task {task_id}")
+
+        # Progress observed: reset duplicate streak.
+        task_storage.update_task(
+            task_id,
+            {"consecutive_duplicate_screenshots": 0, "screenshot_error_count": 0},
+            user_id,
+        )
 
         # Save the screenshot
         screenshot_url = validate_and_save_screenshot(image_data, task_id, user_id)
         if screenshot_url:
             logger.info(f"Screenshot saved successfully: {screenshot_url}")
+            await record_task_observation(
+                agent,
+                task_id,
+                user_id,
+                screenshot_url,
+                source="on_step_start",
+            )
 
     except Exception as e:
         logger.error(f"Error in automated_screenshot for task {task_id}: {str(e)}")
@@ -651,8 +1609,8 @@ async def get_task_status(task_id: str, user_id: str = Depends(get_user_id)):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # Only increment steps for running tasks
-    if task["status"] == TaskStatus.RUNNING:
+    # Optional step tracking on status polling (off by default for performance)
+    if task["status"] == TaskStatus.RUNNING and STATUS_TRACK_STEPS_ON_POLL:
         # Initialize steps array if not present
         current_step = len(task.get("steps", [])) + 1
 
@@ -666,15 +1624,34 @@ async def get_task_status(task_id: str, user_id: str = Depends(get_user_id)):
 
         task_storage.add_task_step(task_id, step_info, user_id)
         logger.info(f"Added step {current_step} for task {task_id}")
-
-    try:
-        _ = agent.browser_session
-        await capture_screenshot(agent, task_id, user_id)
-        # await capture_screenshot(task_storage.get_task_agent(task_id, user_id), task_id, user_id)
-    except (AssertionError, AttributeError):
-        logger.info(
-            f"BrowserSession not ready for task {task_id}, skipping screenshot."
+        add_trajectory_event(
+            task_id,
+            user_id,
+            "step",
+            {
+                "step": current_step,
+                "next_goal": step_info.get("next_goal"),
+                "evaluation_previous_goal": step_info.get("evaluation_previous_goal"),
+            },
         )
+
+    if STATUS_CAPTURE_SCREENSHOT:
+        now_epoch = datetime.now(UTC).timestamp()
+        last_capture_epoch = task.get("last_status_capture_epoch") or 0
+        if (
+            now_epoch - float(last_capture_epoch)
+            >= STATUS_SCREENSHOT_MIN_INTERVAL_SECONDS
+        ):
+            try:
+                _ = agent.browser_session
+                await capture_screenshot(agent, task_id, user_id)
+                task_storage.update_task(
+                    task_id, {"last_status_capture_epoch": now_epoch}, user_id
+                )
+            except (AssertionError, AttributeError):
+                logger.info(
+                    f"BrowserSession not ready for task {task_id}, skipping screenshot."
+                )
 
     return TaskStatusResponse(
         status=task["status"],
@@ -775,6 +1752,52 @@ async def get_task(task_id: str, user_id: str = Depends(get_user_id)):
         raise HTTPException(status_code=404, detail="Task not found")
 
     return task
+
+
+@app.post("/api/v1/task/{task_id}/reward")
+async def set_task_reward(
+    task_id: str,
+    request: RewardRequest,
+    user_id: str = Depends(get_user_id),
+):
+    """Set a manual reward score for a task and override effective reward."""
+    task = task_storage.get_task(task_id, user_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    reward = task.get("reward", {})
+    auto_score = reward.get("auto_score") if isinstance(reward, dict) else None
+    manual_score = request.manual_score
+    now = datetime.now(UTC).isoformat() + "Z"
+
+    task_storage.set_task_reward(
+        task_id,
+        {
+            "auto_score": auto_score,
+            "manual_score": manual_score,
+            "effective_score": manual_score,
+            "source": "manual",
+            "reason": request.reason,
+            "updated_at": now,
+        },
+        user_id,
+    )
+    add_trajectory_event(
+        task_id,
+        user_id,
+        "reward_manual",
+        {
+            "score": manual_score,
+            "reason": request.reason,
+        },
+    )
+
+    updated_task = task_storage.get_task(task_id, user_id)
+    return {
+        "message": "Reward updated",
+        "task_id": task_id,
+        "reward": updated_task.get("reward", {}),
+    }
 
 
 @app.put("/api/v1/stop-task/{task_id}")

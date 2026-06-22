@@ -650,7 +650,8 @@ async def format_extraction_result_with_llm(
     if not llm or not raw_output:
         return extract_result_from_wrapper(raw_output)
 
-    prompt = """You are a data extraction formatter. Parse the following extracted information and return ONLY a valid JSON object with:
+    prompt = (
+        """You are a data extraction formatter. Parse the following extracted information and return ONLY a valid JSON object with:
 1. "summary": A brief 1-2 sentence summary of key findings
 2. "structured_data": An object with clearly named fields for each value
 3. "raw_data": The original extraction preserved exactly as provided
@@ -658,13 +659,17 @@ async def format_extraction_result_with_llm(
 Return ONLY valid JSON, no markdown, no code fences.
 
 Extracted information:
-""" + raw_output
+"""
+        + raw_output
+    )
 
     try:
         from langchain_core.messages import HumanMessage
 
         response = await llm.ainvoke([HumanMessage(content=prompt)])
-        result_text = response.content if hasattr(response, "content") else str(response)
+        result_text = (
+            response.content if hasattr(response, "content") else str(response)
+        )
 
         try:
             parsed = json.loads(result_text)
@@ -676,9 +681,7 @@ Extracted information:
                 return json.dumps(parsed, indent=2)
             return result_text
     except Exception as e:
-        logger.debug(
-            f"LLM formatting failed for task {task_id}, falling back: {e}"
-        )
+        logger.debug(f"LLM formatting failed for task {task_id}, falling back: {e}")
         return extract_result_from_wrapper(raw_output)
 
 

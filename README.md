@@ -318,6 +318,10 @@ python examples/01_basic_flow.py --base-url http://localhost:8000 --provider oll
 python examples/01_basic_flow.py --base-url http://localhost:8000 --provider deepseek
 ```
 
+I'm using Ollama with:
+`OLLAMA_MODEL_ID=gemma4:e4b-it-q4_K_M` #lfm2.5:8b or gemma4:e4b-it-q4_K_M
+to test the examples
+
 Sample query:
 
 ```python

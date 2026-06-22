@@ -53,18 +53,21 @@ The service now supports a hybrid reward model:
 ## Installation
 
 1. Clone this repository:
+
    ```bash
    git clone https://github.com/henry0hai/browser-n8n-local.git
    cd browser-n8n-local
    ```
 
 2. Create a virtual environment (recommended):
+
    ```bash
    python -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
 
 3. Install the required dependencies:
+
    ```bash
    pip install -r requirements.txt
    ```
@@ -78,6 +81,7 @@ The service now supports a hybrid reward model:
 ## Running the Service
 
 1. Start the FastAPI server:
+
    ```bash
    python app.py
    ```
@@ -88,21 +92,21 @@ The service now supports a hybrid reward model:
 
 ## API Endpoints
 
-| Method | Endpoint                           | Description                  |
-|--------|------------------------------------|------------------------------|
-| POST   | /api/v1/run-task                   | Start a new browser task     |
-| GET    | /api/v1/task/{task_id}             | Get task details             |
-| GET    | /api/v1/task/{task_id}/status      | Get task status              |
-| PUT    | /api/v1/stop-task/{task_id}        | Stop a running task          |
-| PUT    | /api/v1/pause-task/{task_id}       | Pause a running task         |
-| PUT    | /api/v1/resume-task/{task_id}      | Resume a paused task         |
-| POST   | /api/v1/task/{task_id}/reward      | Submit manual reward score   |
-| GET    | /api/v1/list-tasks                 | List all tasks               |
-| GET    | /live/{task_id}                    | Live view UI                 |
-| GET    | /api/v1/ping                       | Check health                 |
-| GET    | /api/v1/task/{task_id}/media       | Get task media               |
-| GET    | /api/v1/task/{task_id}/media/list  | List all media from task     |
-| GET    | /api/v1/media/{task_id}/{filename} | Display task media content   |
+| Method | Endpoint                           | Description                |
+| ------ | ---------------------------------- | -------------------------- |
+| POST   | /api/v1/run-task                   | Start a new browser task   |
+| GET    | /api/v1/task/{task_id}             | Get task details           |
+| GET    | /api/v1/task/{task_id}/status      | Get task status            |
+| PUT    | /api/v1/stop-task/{task_id}        | Stop a running task        |
+| PUT    | /api/v1/pause-task/{task_id}       | Pause a running task       |
+| PUT    | /api/v1/resume-task/{task_id}      | Resume a paused task       |
+| POST   | /api/v1/task/{task_id}/reward      | Submit manual reward score |
+| GET    | /api/v1/list-tasks                 | List all tasks             |
+| GET    | /live/{task_id}                    | Live view UI               |
+| GET    | /api/v1/ping                       | Check health               |
+| GET    | /api/v1/task/{task_id}/media       | Get task media             |
+| GET    | /api/v1/task/{task_id}/media/list  | List all media from task   |
+| GET    | /api/v1/media/{task_id}/{filename} | Display task media content |
 
 ## Usage Examples
 
@@ -198,7 +202,7 @@ Look for these fields in the task payload:
 
 ## Configuration Options
 
-You can configure the service by editing the `.env` file.  Available options are grouped below:
+You can configure the service by editing the `.env` file. Available options are grouped below:
 
 ### API Configuration
 
@@ -278,19 +282,19 @@ If `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION` are not explic
 - **API Key Issues**: Verify that your API keys are correctly set in the `.env` file.
 - **Port Conflicts**: If port 8000 is already in use, set a different port in the `.env` file.
 - **`Multimodal data provided, but model does not support multimodal requests`**:
-   - Cause: The selected model is text-only but vision input was sent.
-   - Fix: Set `BROWSER_USE_VISION=false` in `.env` (or use a multimodal model).
-   - For Ollama text-only models such as `lfm2.5:8b`, keep `BROWSER_USE_VISION=false`.
+  - Cause: The selected model is text-only but vision input was sent.
+  - Fix: Set `BROWSER_USE_VISION=false` in `.env` (or use a multimodal model).
+  - For Ollama text-only models such as `lfm2.5:8b`, keep `BROWSER_USE_VISION=false`.
 - **Task seems too slow or loops too long**:
-   - Reduce loop budget with `AGENT_MAX_STEPS=4` to `8`.
-   - Enforce shorter runtime with `TASK_RUN_TIMEOUT_SECONDS=60` to `120`.
-   - Keep status-side overhead low: `STATUS_TRACK_STEPS_ON_POLL=false` and `STATUS_CAPTURE_SCREENSHOT=false`.
-   - Keep `AGENT_ENFORCE_CONCISE_EXECUTION=true` to discourage tool-chatter loops.
-   - Enable early loop stop with `LOOP_GUARD_MAX_CONSECUTIVE_DUPLICATE_SCREENSHOTS=2` to `4`.
-   - Stop unstable browser states with `LOOP_GUARD_MAX_SCREENSHOT_ERRORS=2` to `4`.
+  - Reduce loop budget with `AGENT_MAX_STEPS=4` to `8`.
+  - Enforce shorter runtime with `TASK_RUN_TIMEOUT_SECONDS=60` to `120`.
+  - Keep status-side overhead low: `STATUS_TRACK_STEPS_ON_POLL=false` and `STATUS_CAPTURE_SCREENSHOT=false`.
+  - Keep `AGENT_ENFORCE_CONCISE_EXECUTION=true` to discourage tool-chatter loops.
+  - Enable early loop stop with `LOOP_GUARD_MAX_CONSECUTIVE_DUPLICATE_SCREENSHOTS=2` to `4`.
+  - Stop unstable browser states with `LOOP_GUARD_MAX_SCREENSHOT_ERRORS=2` to `4`.
 
 - **Agent keeps typing into unrelated fields**:
-   - Keep `PASS_SENSITIVE_DATA_TO_AGENT=false` unless your task specifically needs credential autofill behavior.
+  - Keep `PASS_SENSITIVE_DATA_TO_AGENT=false` unless your task specifically needs credential autofill behavior.
 
 ## Examples
 
@@ -313,6 +317,50 @@ Run example with explicit provider override:
 python examples/01_basic_flow.py --base-url http://localhost:8000 --provider ollama
 python examples/01_basic_flow.py --base-url http://localhost:8000 --provider deepseek
 ```
+
+Sample query:
+
+```python
+parser.add_argument(
+    "--task",
+    default=(
+        "Go to google.com and search for 'huntrix golden lyrics'. "
+        "On the search results page, click the first link that points to youtube.com/watch (or a YouTube video card) immediately; do not keep scrolling. "
+        "If clicking a YouTube result fails after one attempt, navigate directly to https://www.youtube.com/results?search_query=huntrix+golden+lyrics and open the first video result. "
+        "On the YouTube watch page, report the view count, like count, and upload/release date shown on the page."
+        "Export the results as a JSON object with keys 'view_count', 'like_count', and 'upload_date'."
+    ),
+    help="Task instruction",
+)
+```
+
+Example output:
+
+````bash
+{
+  "id": "4be9cb39-e067-4d5f-b290-80ffb8358488",
+  "status": "finished",
+  "observations": 0,
+  "trajectory_events": 2,
+  "reward": {
+    "auto_score": 0.8,
+    "manual_score": null,
+    "effective_score": 0.8,
+    "source": "auto",
+    "reason": "task finished with non-empty output",
+    "updated_at": "2026-06-22T07:47:05.100077+00:00Z"
+  },
+  "output": "<url>\nhttps://www.youtube.com/watch?v=htk6MRjmcnQ\n</url>\n<query>\nPlease find the view count, the number of likes, and the upload/release date for the video shown on this page. Structure the output as a JSON object with keys 'view_count', 'like_count', and 'upload_date'.\n</query>\n<result>\n```json\n{\n  \"view_count\": \"164,669,057\",\n  \"like_count\": \"826K\",\n  \"upload_date\": \"Jul 1, 2025\"\n}\n```\n</result>",
+  "error": null
+}
+````
+
+Sample run images:
+
+![Step - 1](examples/sample-01/status-step-1-20260622-132606.png)
+![Step - 2](examples/sample-01/status-step-2-20260622-132637.png)
+![Step - 3](examples/sample-01/status-step-3-20260622-132702.png)
+![Step - 4](examples/sample-01/status-step-4-20260622-132908.png)
 
 ## Limitations (Current Milestone)
 

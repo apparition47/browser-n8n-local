@@ -53,7 +53,7 @@ parser.add_argument(
 
 Example output:
 
-~~~bash
+```bash
 terminal_status=finished
 {
   "id": "344a1b44-c747-4f56-b2a0-ef8382d58d19",
@@ -71,7 +71,7 @@ terminal_status=finished
   "output": "<url>\nhttps://example.com/\n</url>\n<query>\npage title\n</query>\n<result>\nExample Domain\n</result>",
   "error": null
 }
-~~~
+```
 
 ### `01_advanced_flow.py`
 
@@ -93,7 +93,7 @@ parser.add_argument(
 
 Example output:
 
-~~~bash
+````bash
 {
   "id": "4be9cb39-e067-4d5f-b290-80ffb8358488",
   "status": "finished",
@@ -110,4 +110,4 @@ Example output:
   "output": "<url>\nhttps://www.youtube.com/watch?v=htk6MRjmcnQ\n</url>\n<query>\nPlease find the view count, the number of likes, and the upload/release date for the video shown on this page. Structure the output as a JSON object with keys 'view_count', 'like_count', and 'upload_date'.\n</query>\n<result>\n```json\n{\n  \"view_count\": \"164,669,057\",\n  \"like_count\": \"826K\",\n  \"upload_date\": \"Jul 1, 2025\"\n}\n```\n</result>",
   "error": null
 }
-~~~
+````

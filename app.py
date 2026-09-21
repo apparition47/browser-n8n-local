@@ -266,9 +266,11 @@ def get_llm(ai_provider: str):
         kwargs = {"model": model}
 
         if base_url:
-            return ChatOpenAI(model=model, base_url=base_url)
-        else:
-            return ChatOpenAI(model=model)
+            kwargs["base_url"] = base_url
+        if custom_headers:
+            kwargs["default_headers"] = custom_headers
+
+        return ChatOpenAI(**kwargs)
 
 
 def process_screenshot_data(screenshot_data) -> Optional[bytes]:

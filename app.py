@@ -256,6 +256,14 @@ def get_llm(ai_provider: str):
     else:  # default to OpenAI
         base_url = os.environ.get("OPENAI_BASE_URL")
         model = os.environ.get("OPENAI_MODEL_ID", "gpt-4o")
+        custom_headers = None
+        custom_headers_raw = os.environ.get("OPENAI_CUSTOM_HEADERS")
+        if custom_headers_raw:
+            try:
+                custom_headers = json.loads(custom_headers_raw)
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid OPENAI_CUSTOM_HEADERS JSON: {e}")
+        kwargs = {"model": model}
 
         if base_url:
             return ChatOpenAI(model=model, base_url=base_url)

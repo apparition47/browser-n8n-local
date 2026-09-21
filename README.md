@@ -217,6 +217,9 @@ The application supports multiple AI providers. You can specify the provider in 
 - `OPENAI_API_KEY`: Your OpenAI API key.
 - `OPENAI_MODEL_ID`: The model to use (e.g., `gpt-4o`).
 - `OPENAI_BASE_URL`: Optional custom endpoint for OpenAI compatible APIs.
+- `OPENAI_CUSTOM_HEADERS`: Optional JSON object of extra headers to send wit
+h every request (e.g. `{"Authorization": "Bearer your_token_here"}`), useful
+ for gateways/proxies in front of OpenAI-compatible APIs.
 
 #### Anthropic
 

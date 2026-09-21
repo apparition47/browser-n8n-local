@@ -1137,14 +1137,23 @@ async def cleanup_task(browser: Optional[Browser], task_id: str, user_id: str):
 
 
 async def execute_task(
-    task_id: str, instruction: str, ai_provider: str, user_id: str = DEFAULT_USER_ID
+    task_id: str,
+    instruction: str,
+    ai_provider: str,
+    user_id: str = DEFAULT_USER_ID,
+    session_id: Optional[str] = None,
 ):
     """Execute browser task in background - main orchestration function
 
     Chrome paths (CHROME_PATH and CHROME_USER_DATA) are only sourced from
     environment variables for security reasons.
+
+    When session_id is set, the browser/agent are handed off to the
+    session registry instead of being torn down, so a later queued
+    message on the same session can continue in the same browser tab.
     """
     browser = None
+    agent = None
 
     try:
         # Update task status and prepare environment
@@ -1427,24 +1436,30 @@ async def execute_task(
             {"score": auto_score, "reason": auto_reason},
         )
     finally:
-        await cleanup_task(browser, task_id, user_id)
+        if session_id:
+            await _park_session_browser(session_id, agent, browser, user_id)
+        else:
+            await cleanup_task(browser, task_id, user_id)
 
 
 # API Routes
-@app.post("/api/v1/run-task", response_model=TaskResponse)
-async def run_task(request: TaskRequest, user_id: str = Depends(get_user_id)):
-    """Start a browser automation task"""
-    task_id = str(uuid.uuid4())
+def _new_task_record(
+    task_id: str,
+    task_text: str,
+    ai_provider: Optional[str],
+    user_id: str,
+    save_browser_data: bool = False,
+    headful: Optional[bool] = None,
+    use_custom_chrome: Optional[bool] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Build and store a fresh task record. Returns its live_url."""
     now = datetime.now(UTC).isoformat() + "Z"
-
-    # Generate live URL
     live_url = f"/live/{task_id}"
-
-    # Initialize task record
     task_data = {
         "id": task_id,
-        "task": request.task,
-        "ai_provider": request.ai_provider,
+        "task": task_text,
+        "ai_provider": ai_provider,
         "status": TaskStatus.CREATED,
         "created_at": now,
         "finished_at": None,
@@ -1462,25 +1477,48 @@ async def run_task(request: TaskRequest, user_id: str = Depends(get_user_id)):
             "updated_at": None,
         },
         "agent": None,
-        "save_browser_data": request.save_browser_data,
+        "save_browser_data": save_browser_data,
         "browser_data": None,  # Will store browser cookies if requested
         # Store browser configuration options
         "browser_config": {
-            "headful": request.headful,
-            "use_custom_chrome": request.use_custom_chrome,
+            "headful": headful,
+            "use_custom_chrome": use_custom_chrome,
         },
         "last_status_capture_epoch": None,
         "consecutive_duplicate_screenshots": 0,
         "screenshot_error_count": 0,
         "live_url": live_url,
+        "session_id": session_id,
     }
 
-    # Store the task in storage
     task_storage.create_task(task_id, task_data, user_id)
+    return live_url
+
+
+@app.post("/api/v1/run-task", response_model=TaskResponse)
+async def run_task(
+    request: TaskRequest,
+    user_id: str = Depends(get_user_id),
+    session_id: Optional[str] = None,
+):
+    """Start a browser automation task"""
+    task_id = str(uuid.uuid4())
+    live_url = _new_task_record(
+        task_id,
+        request.task,
+        request.ai_provider,
+        user_id,
+        save_browser_data=request.save_browser_data,
+        headful=request.headful,
+        use_custom_chrome=request.use_custom_chrome,
+        session_id=session_id,
+    )
 
     # Start task in background
     ai_provider = request.ai_provider or "openai"
-    asyncio.create_task(execute_task(task_id, request.task, ai_provider, user_id))
+    asyncio.create_task(
+        execute_task(task_id, request.task, ai_provider, user_id, session_id=session_id)
+    )
 
     return TaskResponse(id=task_id, status=TaskStatus.CREATED, live_url=live_url)
 
@@ -1880,6 +1918,505 @@ async def list_tasks(
 ):
     """List all tasks"""
     return task_storage.list_tasks(user_id, page, per_page)
+
+
+# --- Browser Use Cloud v4 API compatibility layer ---
+# Lets the n8n-nodes-browser-use-cloud community node point at this local
+# bridge instead of the real Browser Use Cloud.
+#
+# Run: create/get/get-many/cancel/status/events/attachments, mapped onto
+# this bridge's existing task model.
+#
+# Session: the cloud keeps one browser open across queued follow-up
+# messages. Here that's real too - the agent/browser created for a run
+# started with a sessionId are kept alive (see _park_session_browser)
+# instead of being closed, and later messages are driven into the same
+# agent via Agent.add_new_task() rather than starting a fresh browser.
+#
+# Browser: a standalone browser with no agent/task attached. Backed by a
+# real browser_use Browser session with a periodic screenshot loop for a
+# minimal live view, since nothing else drives it.
+
+_CLOUD_RUN_TERMINAL_STATUS = {
+    TaskStatus.FINISHED: "completed",
+    TaskStatus.FAILED: "failed",
+    TaskStatus.STOPPED: "cancelled",
+}
+
+
+def _to_cloud_run_status(local_status: str) -> str:
+    return _CLOUD_RUN_TERMINAL_STATUS.get(local_status, local_status)
+
+
+def _task_to_cloud_run(task: dict) -> dict:
+    return {
+        "id": task["id"],
+        "status": _to_cloud_run_status(task["status"]),
+        "task": task.get("task"),
+        "result": task.get("output"),
+        "error": task.get("error"),
+        "createdAt": task.get("created_at"),
+    }
+
+
+@app.get("/api/v1/tasks")
+async def cloud_tasks_probe():
+    """Dummy endpoint the n8n credential's connection test hits."""
+    return {"tasks": []}
+
+
+@app.post("/api/v1/runs")
+async def create_cloud_run(request: Request, user_id: str = Depends(get_user_id)):
+    body = await request.json()
+    task_text = body.get("task")
+    if not task_text:
+        raise HTTPException(status_code=400, detail='The "task" field is required.')
+
+    session_id = body.get("sessionId")
+    if session_id:
+        return await _create_or_continue_session_run(session_id, task_text, user_id)
+
+    response = await run_task(TaskRequest(task=task_text), user_id)
+    return {"id": response.id, "status": _to_cloud_run_status(response.status), "task": task_text}
+
+
+@app.get("/api/v1/runs/{run_id}")
+async def get_cloud_run(run_id: str, user_id: str = Depends(get_user_id)):
+    task = task_storage.get_task(run_id, user_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return _task_to_cloud_run(task)
+
+
+@app.get("/api/v1/runs/{run_id}/status")
+async def get_cloud_run_status(run_id: str, user_id: str = Depends(get_user_id)):
+    task = task_storage.get_task(run_id, user_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {"id": run_id, "status": _to_cloud_run_status(task["status"])}
+
+
+@app.post("/api/v1/runs/{run_id}/cancel")
+async def cancel_cloud_run(run_id: str, user_id: str = Depends(get_user_id)):
+    await stop_task(run_id, user_id)
+    task = task_storage.get_task(run_id, user_id)
+    return _task_to_cloud_run(task)
+
+
+@app.get("/api/v1/runs")
+async def list_cloud_runs(
+    user_id: str = Depends(get_user_id),
+    cursor: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=100),
+):
+    page = int(cursor) if cursor else 1
+    result = task_storage.list_tasks(user_id, page, limit)
+    runs = [_task_to_cloud_run(task) for task in result.get("tasks", [])]
+    has_more = page * limit < result.get("total", 0)
+    return {
+        "runs": runs,
+        "hasMore": has_more,
+        "nextCursor": str(page + 1) if has_more else None,
+    }
+
+
+@app.get("/api/v1/runs/{run_id}/events")
+async def get_cloud_run_events(run_id: str, user_id: str = Depends(get_user_id)):
+    if not task_storage.task_exists(run_id, user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    # No step-by-step event stream is recorded locally.
+    return {"events": [], "hasMore": False, "nextAfter": None}
+
+
+@app.get("/api/v1/runs/{run_id}/attachments")
+async def get_cloud_run_attachments(run_id: str, user_id: str = Depends(get_user_id)):
+    media = await list_task_media(run_id, user_id)
+    attachments = [
+        {"id": item["filename"], "filename": item["filename"], "url": item["url"]}
+        for item in media.get("media", [])
+    ]
+    return {"attachments": attachments}
+
+
+# --- Session resource: real cross-run continuity on one browser ---
+# session_id -> {id, user_id, ai_provider, status, current_run_id, agent,
+#                browser, queue: [{id, text, run_id}], next_message_id,
+#                created_at}
+_sessions: dict = {}
+
+
+def _session_to_cloud(session: dict) -> dict:
+    return {
+        "id": session["id"],
+        "status": session["status"],
+        "currentRunId": session["current_run_id"],
+        "createdAt": session["created_at"],
+    }
+
+
+async def _park_session_browser(
+    session_id: str, agent, browser: Optional[Browser], user_id: str
+):
+    """Called from execute_task's finally block for session-owned runs.
+
+    Keeps the browser/agent alive in the session registry instead of
+    closing them, then drains any messages queued while this run executed.
+    """
+    session = _sessions.get(session_id)
+    if not session:
+        # Session was purged while its first run was still executing.
+        await cleanup_task(browser, f"session-{session_id}", user_id)
+        return
+
+    session["agent"] = agent
+    session["browser"] = browser
+    session["status"] = "idle"
+    session["current_run_id"] = None
+    asyncio.create_task(_drain_session_queue(session_id, user_id))
+
+
+async def _run_session_continuation(
+    session_id: str, task_id: str, message_text: str, user_id: str
+):
+    """Drive a follow-up message into a session's already-open agent/browser."""
+    session = _sessions.get(session_id)
+    agent = session.get("agent") if session else None
+
+    task_storage.update_task_status(task_id, TaskStatus.RUNNING, user_id)
+    if agent is not None:
+        task_storage.set_task_agent(task_id, agent, user_id)
+
+    try:
+        if agent is None:
+            raise RuntimeError(
+                "Session has no active browser/agent to continue (it may have failed or been purged)"
+            )
+
+        agent.add_new_task(message_text)
+
+        async def _on_step_start(agent_instance):
+            await automated_screenshot(agent_instance, task_id, user_id)
+
+        run_kwargs = {
+            "on_step_start": lambda agent_instance: asyncio.create_task(
+                _on_step_start(agent_instance)
+            ),
+        }
+        if AGENT_MAX_STEPS > 0:
+            run_kwargs["max_steps"] = AGENT_MAX_STEPS
+
+        try:
+            run_coro = agent.run(**run_kwargs)
+        except TypeError:
+            run_kwargs.pop("max_steps", None)
+            run_coro = agent.run(**run_kwargs)
+
+        if TASK_RUN_TIMEOUT_SECONDS > 0:
+            result = await asyncio.wait_for(run_coro, timeout=TASK_RUN_TIMEOUT_SECONDS)
+        else:
+            result = await run_coro
+
+        await process_task_result(result, task_id, user_id)
+        task_storage.mark_task_finished(task_id, user_id, TaskStatus.FINISHED)
+    except Exception as e:
+        logger.exception(f"Error continuing session {session_id} run {task_id}")
+        task_storage.update_task_status(task_id, TaskStatus.FAILED, user_id)
+        task_storage.set_task_error(task_id, str(e), user_id)
+        task_storage.mark_task_finished(task_id, user_id, TaskStatus.FAILED)
+    finally:
+        if session:
+            session["status"] = "idle"
+            session["current_run_id"] = None
+            asyncio.create_task(_drain_session_queue(session_id, user_id))
+
+
+async def _drain_session_queue(session_id: str, user_id: str):
+    """Pop and run the next queued message, if the session is idle and has one.
+
+    A session runs one message at a time, matching the cloud API's own
+    "a session runs one run at a time" semantics.
+    """
+    session = _sessions.get(session_id)
+    if not session or session["status"] != "idle" or not session["queue"]:
+        return
+
+    message = session["queue"].pop(0)
+    task_id = str(uuid.uuid4())
+    _new_task_record(
+        task_id, message["text"], session.get("ai_provider"), user_id, session_id=session_id
+    )
+    message["run_id"] = task_id
+    session["status"] = "running"
+    session["current_run_id"] = task_id
+    await _run_session_continuation(session_id, task_id, message["text"], user_id)
+
+
+async def _create_or_continue_session_run(session_id: str, task_text: str, user_id: str):
+    """POST /runs with a sessionId: start a brand-new session, or continue
+    an idle one in its existing browser."""
+    session = _sessions.get(session_id)
+
+    if session and session["status"] == "running":
+        raise HTTPException(
+            status_code=409,
+            detail="Session already has an active run. Wait for it to finish or cancel it first.",
+        )
+
+    if session is None:
+        # Brand-new session: run normally (fresh browser); execute_task
+        # will hand the browser off to the session registry when it's done.
+        task_id = str(uuid.uuid4())
+        _sessions[session_id] = {
+            "id": session_id,
+            "user_id": user_id,
+            "ai_provider": None,
+            "status": "running",
+            "current_run_id": task_id,
+            "agent": None,
+            "browser": None,
+            "queue": [],
+            "next_message_id": 1,
+            "created_at": datetime.now(UTC).isoformat() + "Z",
+        }
+        live_url = _new_task_record(task_id, task_text, None, user_id, session_id=session_id)
+        ai_provider = os.environ.get("DEFAULT_AI_PROVIDER", "openai")
+        _sessions[session_id]["ai_provider"] = ai_provider
+        asyncio.create_task(
+            execute_task(task_id, task_text, ai_provider, user_id, session_id=session_id)
+        )
+        return {"id": task_id, "status": "created", "task": task_text, "sessionId": session_id}
+
+    # Idle session: continue in the same browser instead of starting a new one.
+    task_id = str(uuid.uuid4())
+    _new_task_record(
+        task_id, task_text, session.get("ai_provider"), user_id, session_id=session_id
+    )
+    session["status"] = "running"
+    session["current_run_id"] = task_id
+    asyncio.create_task(_run_session_continuation(session_id, task_id, task_text, user_id))
+    return {"id": task_id, "status": "created", "task": task_text, "sessionId": session_id}
+
+
+@app.get("/api/v1/sessions/{session_id}")
+async def get_cloud_session(session_id: str, user_id: str = Depends(get_user_id)):
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return _session_to_cloud(session)
+
+
+@app.get("/api/v1/sessions")
+async def list_cloud_sessions(
+    user_id: str = Depends(get_user_id),
+    cursor: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=100),
+):
+    items = [s for s in _sessions.values() if s["user_id"] == user_id]
+    page = int(cursor) if cursor else 1
+    start = (page - 1) * limit
+    end = start + limit
+    page_items = items[start:end]
+    has_more = end < len(items)
+    return {
+        "sessions": [_session_to_cloud(s) for s in page_items],
+        "hasMore": has_more,
+        "nextCursor": str(page + 1) if has_more else None,
+    }
+
+
+@app.post("/api/v1/sessions/{session_id}/queue")
+async def queue_session_message(
+    session_id: str, request: Request, user_id: str = Depends(get_user_id)
+):
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    body = await request.json()
+    text = str(body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail='The "text" field is required.')
+
+    message_id = session["next_message_id"]
+    session["next_message_id"] += 1
+    session["queue"].append({"id": message_id, "text": text, "run_id": None})
+
+    if session["status"] == "idle":
+        asyncio.create_task(_drain_session_queue(session_id, user_id))
+
+    return {"id": message_id, "sessionId": session_id, "status": "queued"}
+
+
+@app.get("/api/v1/sessions/{session_id}/queue")
+async def get_session_queue(session_id: str, user_id: str = Depends(get_user_id)):
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "queue": [
+            {"id": m["id"], "text": m["text"], "runId": m["run_id"]}
+            for m in session["queue"]
+        ]
+    }
+
+
+@app.delete("/api/v1/sessions/{session_id}/queue/{message_id}")
+async def cancel_queued_message(
+    session_id: str, message_id: int, user_id: str = Depends(get_user_id)
+):
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    before = len(session["queue"])
+    session["queue"] = [m for m in session["queue"] if m["id"] != message_id]
+    if len(session["queue"]) == before:
+        raise HTTPException(status_code=404, detail="Queued message not found")
+    return {"success": True}
+
+
+@app.post("/api/v1/sessions/{session_id}/purge")
+async def purge_cloud_session(session_id: str, user_id: str = Depends(get_user_id)):
+    session = _sessions.pop(session_id, None)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    agent = session.get("agent")
+    if agent:
+        try:
+            agent.stop()
+        except Exception as e:
+            logger.error(f"Error stopping agent for session {session_id}: {e}")
+
+    await cleanup_task(session.get("browser"), f"session-{session_id}", user_id)
+    return {"success": True, "sessionId": session_id}
+
+
+# --- Browser resource: standalone browser, no agent/task attached ---
+_browsers: dict = {}
+BROWSER_SCREENSHOT_INTERVAL_SECONDS = 3
+
+
+def _browser_to_cloud(entry: dict) -> dict:
+    return {
+        "id": entry["id"],
+        "status": entry["status"],
+        "liveUrl": f"/live/browser/{entry['id']}",
+        "createdAt": entry["created_at"],
+    }
+
+
+async def _browser_screenshot_loop(browser_id: str, browser_session: Browser):
+    media_dir = MEDIA_DIR / f"browser-{browser_id}"
+    media_dir.mkdir(exist_ok=True, parents=True)
+    while True:
+        entry = _browsers.get(browser_id)
+        if not entry or entry["status"] != "running":
+            return
+        try:
+            png_bytes = await browser_session.take_screenshot()
+            (media_dir / "latest.png").write_bytes(png_bytes)
+        except Exception as e:
+            logger.debug(f"Standalone browser {browser_id} screenshot failed: {e}")
+        await asyncio.sleep(BROWSER_SCREENSHOT_INTERVAL_SECONDS)
+
+
+@app.post("/api/v1/browsers")
+async def create_cloud_browser(user_id: str = Depends(get_user_id)):
+    browser_id = str(uuid.uuid4())
+    browser_session, _ = configure_browser_profile({})
+    if browser_session is None:
+        browser_session = Browser(browser_profile=BrowserProfile(headless=True))
+    await browser_session.start()
+
+    _browsers[browser_id] = {
+        "id": browser_id,
+        "browser": browser_session,
+        "status": "running",
+        "user_id": user_id,
+        "created_at": datetime.now(UTC).isoformat() + "Z",
+    }
+    asyncio.create_task(_browser_screenshot_loop(browser_id, browser_session))
+    return _browser_to_cloud(_browsers[browser_id])
+
+
+@app.get("/api/v1/browsers/{browser_id}")
+async def get_cloud_browser(browser_id: str, user_id: str = Depends(get_user_id)):
+    entry = _browsers.get(browser_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+    return _browser_to_cloud(entry)
+
+
+@app.get("/api/v1/browsers")
+async def list_cloud_browsers(
+    user_id: str = Depends(get_user_id),
+    pageNumber: int = Query(1, ge=1),
+    pageSize: int = Query(50, ge=1, le=100),
+):
+    items = [e for e in _browsers.values() if e["user_id"] == user_id]
+    start = (pageNumber - 1) * pageSize
+    end = start + pageSize
+    return {
+        "items": [_browser_to_cloud(e) for e in items[start:end]],
+        "totalItems": len(items),
+    }
+
+
+@app.patch("/api/v1/browsers/{browser_id}")
+async def stop_cloud_browser(browser_id: str, user_id: str = Depends(get_user_id)):
+    entry = _browsers.get(browser_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+
+    entry["status"] = "stopped"
+    try:
+        await entry["browser"].stop()
+    except Exception as e:
+        logger.error(f"Error stopping standalone browser {browser_id}: {e}")
+    return _browser_to_cloud(entry)
+
+
+@app.get("/api/v1/browsers/{browser_id}/downloads")
+async def get_cloud_browser_downloads(
+    browser_id: str,
+    user_id: str = Depends(get_user_id),
+    cursor: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=100),
+    includeUrls: Optional[str] = None,
+):
+    entry = _browsers.get(browser_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+
+    downloaded = getattr(entry["browser"], "downloaded_files", None) or []
+    files = [{"filename": Path(p).name, "path": str(p)} for p in downloaded]
+    return {"files": files, "hasMore": False, "nextCursor": None}
+
+
+@app.get("/live/browser/{browser_id}", response_class=HTMLResponse)
+async def browser_live_view(browser_id: str, user_id: str = Depends(get_user_id)):
+    """Minimal auto-refreshing screenshot view for a standalone browser session."""
+    if browser_id not in _browsers:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+
+    img_url = f"/api/v1/media/browser-{browser_id}/latest.png"
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Standalone Browser {browser_id}</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0;background:#111;">
+    <img id="shot" src="{img_url}" style="width:100%;height:auto;display:block;" />
+    <script>
+        setInterval(() => {{
+            document.getElementById('shot').src = '{img_url}?t=' + Date.now();
+        }}, {BROWSER_SCREENSHOT_INTERVAL_SECONDS * 1000});
+    </script>
+</body>
+</html>"""
 
 
 @app.get("/live/{task_id}", response_class=HTMLResponse)

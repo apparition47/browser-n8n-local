@@ -108,6 +108,68 @@ The service now supports a hybrid reward model:
 | GET    | /api/v1/task/{task_id}/media/list  | List all media from task   |
 | GET    | /api/v1/media/{task_id}/{filename} | Display task media content |
 
+## Browser Use Cloud v4 Compatibility (n8n Community Node)
+
+This bridge also implements the **Run**, **Session**, and **Browser** resources of the [Browser Use Cloud v4 API](https://docs.browser-use.com/cloud), so the [`n8n-nodes-browser-use-cloud`](https://www.npmjs.com/package/n8n-nodes-browser-use-cloud) community node can point at your local server instead of the real cloud service.
+
+### Setting up the credential
+
+In n8n, create a **Browser Use API** credential:
+
+- **API Key**: any non-empty value (e.g. `not-needed`) — this local server doesn't check it.
+- **Base URL**: `http://host.docker.internal:<PORT>/api/v1` (use `host.docker.internal` if n8n runs in Docker and the bridge runs on the host; use `http://localhost:<PORT>/api/v1` if both run on the same host network).
+
+The credential's connection test hits `GET {baseUrl}/tasks`, which this bridge stubs out to always return `200`.
+
+In the node itself, select **API Version: v4** for every operation — the base URL you set (ending in `/api/v1`, not `/v2`/`/v3`/`/v4`) is left untouched by the node's version-rewriting logic, so all v4-shaped requests land on this same `/api/v1` prefix.
+
+### Run resource
+
+Maps directly onto the existing task model (`run-task` / `task/{id}/status` / `stop-task` / `list-tasks`).
+
+| Method | Endpoint                          | Node operation |
+| ------ | ---------------------------------- | -------------- |
+| POST   | /api/v1/runs                       | Create, Run and Wait |
+| GET    | /api/v1/runs/{run_id}               | Get |
+| GET    | /api/v1/runs/{run_id}/status        | (used internally by Run and Wait's polling) |
+| POST   | /api/v1/runs/{run_id}/cancel        | Cancel |
+| GET    | /api/v1/runs                       | Get Many |
+| GET    | /api/v1/runs/{run_id}/events        | Get Events (always returns empty — no step event stream is recorded locally) |
+| GET    | /api/v1/runs/{run_id}/attachments   | Get Attachments (mapped to the run's task media) |
+
+Fields on the run-create body that only make sense against the real cloud service are accepted but ignored: `model`, `modelParams`, `workspaceId`, `maxCostUsd`, `attachedFileIds`, `judge`, `browserSettings`. Only `task` (and `sessionId`, see below) are used.
+
+### Session resource
+
+The cloud API keeps one browser open across queued follow-up messages. This bridge does the same for real: the browser used for the first run in a session is kept alive afterward instead of being closed, and later messages are driven into the same live agent (`Agent.add_new_task`), so follow-ups continue from the same page state rather than starting a fresh browser.
+
+| Method | Endpoint                                        | Node operation |
+| ------ | ------------------------------------------------ | -------------- |
+| POST   | /api/v1/runs (with `sessionId` in the body)       | Create/continue a session via Run &rarr; Create |
+| GET    | /api/v1/sessions/{session_id}                     | Get |
+| GET    | /api/v1/sessions                                  | Get Many |
+| POST   | /api/v1/sessions/{session_id}/queue               | Queue Message |
+| GET    | /api/v1/sessions/{session_id}/queue               | Get Queue |
+| DELETE | /api/v1/sessions/{session_id}/queue/{message_id}  | Cancel Queued Message |
+| POST   | /api/v1/sessions/{session_id}/purge               | Purge (stops the agent, closes the browser, deletes the session) |
+
+A session only runs one message at a time — starting a new run against a session that already has one in flight returns `409 Conflict`, matching the cloud API's behavior.
+
+### Browser resource
+
+A standalone browser with no agent or task attached — useful for holding a browser open independent of any automation run.
+
+| Method | Endpoint                                     | Node operation |
+| ------ | ----------------------------------------------| -------------- |
+| POST   | /api/v1/browsers                              | Create |
+| GET    | /api/v1/browsers/{browser_id}                 | Get |
+| GET    | /api/v1/browsers                              | Get Many |
+| PATCH  | /api/v1/browsers/{browser_id}                 | Stop |
+| GET    | /api/v1/browsers/{browser_id}/downloads       | Get Downloads |
+| GET    | /live/browser/{browser_id}                    | Minimal auto-refreshing live screenshot view |
+
+Backed by a real `browser_use` browser session with a periodic screenshot loop (every 3s) so it's watchable, but nothing drives it — no agent is attached until something else (e.g. a future feature) takes it over.
+
 ## Usage Examples
 
 ### Provider Selection (Important)

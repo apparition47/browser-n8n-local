@@ -180,7 +180,9 @@ Each browser has its own downloads directory (`media/browser-{browser_id}/downlo
 
 ### Bridge extensions (`/bridge/*`, not part of v4)
 
-Everything outside the v4 spec lives under `/bridge/` so it can never be mistaken for, or collide with, a v4 route. (One exception: `GET /api/v4/tasks` is a stub that always returns `{"tasks": []}`, because the n8n community node's connection test requests `{baseUrl}/tasks`.)
+Private endpoints that extend the Browser Use API for this bridge. They are not part of the Browser Use Cloud v4 spec and have no equivalent on the real cloud, so they live under their own `/bridge/` prefix instead of `/api/v4`.
+
+Separately, `GET /api/v4/tasks` is a stub that always returns `{"tasks": []}`. It exists only because the n8n community node's credential test requests `{baseUrl}/tasks`.
 
 | Method | Endpoint                                     | Notes |
 | ------ | ----------------------------------------------| ----- |

@@ -90,6 +90,67 @@ The service now supports a hybrid reward model:
 
 3. You can access the API documentation at http://localhost:8000/docs
 
+### Running as a macOS Service (launchd)
+
+To keep the server running in the background and auto-restart on crash/login, use a launchd LaunchAgent:
+
+1. Create `~/Library/LaunchAgents/com.browser-n8n-local.plist`:
+
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+       <key>Label</key>
+       <string>com.browser-n8n-local</string>
+
+       <key>ProgramArguments</key>
+       <array>
+           <string>/path/to/browser-n8n-local/venv/bin/python</string>
+           <string>/path/to/browser-n8n-local/app.py</string>
+       </array>
+
+       <key>WorkingDirectory</key>
+       <string>/path/to/browser-n8n-local</string>
+
+       <key>RunAtLoad</key>
+       <true/>
+
+       <key>KeepAlive</key>
+       <true/>
+
+       <key>StandardOutPath</key>
+       <string>/path/to/browser-n8n-local/logs/service.out.log</string>
+
+       <key>StandardErrorPath</key>
+       <string>/path/to/browser-n8n-local/logs/service.err.log</string>
+   </dict>
+   </plist>
+   ```
+
+   Replace `/path/to/browser-n8n-local` with your actual install path, and create the `logs/` directory.
+
+2. Load and start it:
+
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.browser-n8n-local.plist
+   ```
+
+3. Check status / logs:
+
+   ```bash
+   launchctl list | grep browser-n8n-local
+   tail -f logs/service.err.log
+   ```
+
+4. Stop / unload:
+
+   ```bash
+   launchctl unload ~/Library/LaunchAgents/com.browser-n8n-local.plist
+   ```
+
+`.env` is loaded automatically via `load_dotenv()` since `WorkingDirectory` is set to the project root.
+
 ## API Endpoints
 
 | Method | Endpoint                           | Description                |
@@ -166,9 +227,12 @@ A standalone browser with no agent or task attached — useful for holding a bro
 | GET    | /api/v1/browsers                              | Get Many |
 | PATCH  | /api/v1/browsers/{browser_id}                 | Stop |
 | GET    | /api/v1/browsers/{browser_id}/downloads       | Get Downloads |
+| GET    | /api/v1/browsers/{browser_id}/downloads/{filename} | Fetch a downloaded file's bytes |
 | GET    | /live/browser/{browser_id}                    | Minimal auto-refreshing live screenshot view |
 
 Backed by a real `browser_use` browser session with a periodic screenshot loop (every 3s) so it's watchable, but nothing drives it — no agent is attached until something else (e.g. a future feature) takes it over.
+
+Each standalone browser gets a real, dedicated downloads directory (`media/browser-{browser_id}/downloads/`) configured via `browser_use`'s `downloads_path`, so anything the browser downloads while it's open actually lands somewhere retrievable. `GET .../downloads` matches the real [Browser Use Cloud v4 "List Browser Session Downloads"](https://docs.browser-use.com/cloud/api-v4/browsers/list-browser-session-downloads) contract exactly — `path`, `size`, `lastModified`, `hasMore`, `nextCursor`, and (with `?includeUrls=true`) a `url` per file. The one deviation: since this bridge has no object storage, `url` points at this bridge's own `GET .../downloads/{filename}` route (real file bytes, served directly) instead of a presigned, expiring S3 URL — it doesn't expire, but works the same way from a client's perspective.
 
 ## Usage Examples
 

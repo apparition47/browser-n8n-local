@@ -263,8 +263,8 @@ def get_llm(ai_provider: str):
                 custom_headers = json.loads(custom_headers_raw)
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid OPENAI_CUSTOM_HEADERS JSON: {e}")
-        kwargs = {"model": model}
 
+        kwargs = {"model": model}
         if base_url:
             kwargs["base_url"] = base_url
         if custom_headers:
@@ -421,8 +421,17 @@ def validate_and_save_screenshot(
 
 def configure_browser_profile(
     task_browser_config: dict,
+    downloads_dir: Optional[Path] = None,
+    keep_alive: bool = False,
 ) -> tuple[Optional[Browser], dict]:
-    """Configure browser based on task and environment settings"""
+    """Configure browser based on task and environment settings.
+
+    downloads_dir: when set, file downloads triggered during this browser's
+    session are saved here instead of wherever Chrome's default download
+    location is. Callers pass MEDIA_DIR / task_id so downloaded files show
+    up via the existing /api/v1/task/{task_id}/media(/list) endpoints,
+    which already glob that exact directory.
+    """
     # Configure browser headless/headful mode (task setting overrides env var)
     task_headful = task_browser_config.get("headful")
     if task_headful is not None:
@@ -465,6 +474,13 @@ def configure_browser_profile(
             extra_chromium_args.append(f"--user-data-dir={chrome_user_data}")
             logger.info(f"Using Chrome user data directory: {chrome_user_data}")
 
+        if downloads_dir:
+            downloads_dir.mkdir(parents=True, exist_ok=True)
+            browser_config_args["downloads_path"] = str(downloads_dir)
+            logger.info(f"Using downloads directory: {downloads_dir}")
+
+        if keep_alive:
+            browser_config_args["keep_alive"] = True
         browser_config = BrowserProfile(**browser_config_args)
         browser = Browser(browser_profile=browser_config)
         browser_info["browser_config_args"] = browser_config_args
@@ -892,6 +908,70 @@ async def try_simple_title_shortcut(
         return None
 
 
+async def _fetch_dataclub_login_code(max_wait: int = 90, max_age: int = 180) -> str:
+    """Poll the mailbox (via the `gws` CLI) for the newest DataClub Tax verification email and return its code.
+
+    Only mail from dataclubtax.ca is ever read. Accepts a message no older than `max_age` seconds so a
+    stale code from an earlier attempt isn't reused; waits up to `max_wait` seconds for a fresh one.
+    """
+    import time as _time
+
+    env = {**os.environ, "PATH": "/usr/local/bin:/usr/bin:/bin"}
+
+    async def _gws(*args):
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/local/bin/gws", "gmail", "users", "messages", *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError(f"gws failed: {err.decode(errors='replace')[:200]}")
+        return json.loads(out.decode())
+
+    deadline = _time.time() + max_wait
+    seen_stale = False
+    while _time.time() < deadline:
+        listing = await _gws("list", "--params", json.dumps(
+            {"userId": "me", "q": "from:dataclubtax.ca newer_than:10m", "maxResults": 1}))
+        msgs = listing.get("messages") or []
+        if msgs:
+            msg = await _gws("get", "--params", json.dumps(
+                {"userId": "me", "id": msgs[0]["id"], "format": "metadata"}))
+            age = _time.time() - int(msg.get("internalDate", 0)) / 1000
+            m = re.search(r"verification code is:?\s*(\d{6})", msg.get("snippet", ""))
+            if m and age <= max_age:
+                return m.group(1)
+            seen_stale = True
+        await asyncio.sleep(5)
+    raise RuntimeError(
+        "No fresh DataClub verification email arrived in time"
+        + (" (only an older code was found)" if seen_stale else "")
+    )
+
+
+def build_custom_tools():
+    """Extra browser-use actions available to every agent run."""
+    from browser_use import Tools, ActionResult
+
+    tools = Tools()
+
+    @tools.action(
+        "Get the 6-digit DataClub Tax login verification code from the company mailbox. "
+        "Call this ONLY after you have clicked 'Send code' and the code-entry screen is showing. "
+        "It waits for the email and returns the code; then type that code into the field and submit. "
+        "Never click 'Send code' or 'Resend' a second time to retry - every new request invalidates the previous code. "
+        "If this action reports no email, call it again instead of requesting another code."
+    )
+    async def get_dataclub_login_code() -> ActionResult:
+        try:
+            code = await _fetch_dataclub_login_code()
+        except Exception as e:  # surface to the agent so it can retry the action
+            return ActionResult(extracted_content=f"Could not get the code: {e}")
+        return ActionResult(extracted_content=f"The DataClub verification code is {code}")
+
+    return tools
+
+
 def create_agent_config(
     instruction: str,
     llm,
@@ -909,6 +989,11 @@ def create_agent_config(
 
     if browser:
         agent_kwargs["browser"] = browser
+
+    try:
+        agent_kwargs["tools"] = build_custom_tools()
+    except Exception as e:  # never block a run because the extra tool failed to register
+        logger.warning(f"Custom tools unavailable: {e}")
 
     return agent_kwargs
 
@@ -1163,8 +1248,13 @@ async def execute_task(
     ai_provider: str,
     user_id: str = DEFAULT_USER_ID,
     session_id: Optional[str] = None,
+    browser_override: Optional[Browser] = None,
 ):
     """Execute browser task in background - main orchestration function
+
+    browser_override: a standalone browser (POST /api/v1/browsers, keep_alive) to drive instead of
+    launching a fresh one. It is left open when the run ends, so cookies/login/page state persist
+    across runs - unlike session continuations, whose browser is reset between runs.
 
     Chrome paths (CHROME_PATH and CHROME_USER_DATA) are only sourced from
     environment variables for security reasons.
@@ -1190,7 +1280,21 @@ async def execute_task(
         logger.info(
             f"Task {task_id}: Using ai_provider={ai_provider}, llm_class={llm.__class__.__name__}"
         )
-        browser, browser_info = configure_browser_profile(task_browser_config)
+        # Downloads are always saved under THIS task's media dir. When this
+        # call starts a new session, that's the session's first task_id —
+        # later continuations of the same session reuse this same browser
+        # object (see _run_session_continuation) rather than recreating the
+        # profile, so every download for the whole session lands here, not
+        # under each individual continuation's own task_id.
+        if browser_override is not None:
+            browser, browser_info = browser_override, {"standalone_browser": True}
+        else:
+            # Session-owned browsers must survive between runs (login, cookies, current page); without
+            # keep_alive the agent resets the browser when each run ends, so a follow-up message in the
+            # same session would find a blank tab.
+            browser, browser_info = configure_browser_profile(
+                task_browser_config, downloads_dir=MEDIA_DIR / task_id, keep_alive=bool(session_id)
+            )
         logger.info(f"Task {task_id}: Browser configuration: {browser_info}")
 
         # Create agent
@@ -1459,6 +1563,8 @@ async def execute_task(
     finally:
         if session_id:
             await _park_session_browser(session_id, agent, browser, user_id)
+        elif browser_override is not None:
+            logger.info(f"Task {task_id}: standalone browser left open")
         else:
             await cleanup_task(browser, task_id, user_id)
 
@@ -1993,6 +2099,19 @@ async def create_cloud_run(request: Request, user_id: str = Depends(get_user_id)
     if not task_text:
         raise HTTPException(status_code=400, detail='The "task" field is required.')
 
+    browser_id = body.get("browserId")
+    if browser_id:
+        entry = _browsers.get(browser_id)
+        if not entry or entry.get("status") != "running":
+            raise HTTPException(status_code=404, detail="Browser not found or not running")
+        task_id = str(uuid.uuid4())
+        _new_task_record(task_id, task_text, None, user_id)
+        ai_provider = os.environ.get("DEFAULT_AI_PROVIDER", "openai")
+        asyncio.create_task(
+            execute_task(task_id, task_text, ai_provider, user_id, browser_override=entry["browser"])
+        )
+        return {"id": task_id, "status": "created", "task": task_text, "browserId": browser_id}
+
     session_id = body.get("sessionId")
     if session_id:
         return await _create_or_continue_session_run(session_id, task_text, user_id)
@@ -2071,6 +2190,8 @@ def _session_to_cloud(session: dict) -> dict:
         "id": session["id"],
         "status": session["status"],
         "currentRunId": session["current_run_id"],
+        # Downloads for the whole session land under the FIRST run's media dir (see execute_task).
+        "firstRunId": session.get("first_run_id"),
         "createdAt": session["created_at"],
     }
 
@@ -2124,7 +2245,11 @@ async def _run_session_continuation(
             ),
         }
         if AGENT_MAX_STEPS > 0:
-            run_kwargs["max_steps"] = AGENT_MAX_STEPS
+            # browser-use counts steps cumulatively (`while n_steps <= max_steps`), so a follow-up in a
+            # long session would otherwise return instantly with the previous answer once the agent has
+            # used AGENT_MAX_STEPS in total. Give every follow-up its own budget.
+            steps_so_far = int(getattr(getattr(agent, "state", None), "n_steps", 0) or 0)
+            run_kwargs["max_steps"] = steps_so_far + AGENT_MAX_STEPS
 
         try:
             run_coro = agent.run(**run_kwargs)
@@ -2193,6 +2318,7 @@ async def _create_or_continue_session_run(session_id: str, task_text: str, user_
             "ai_provider": None,
             "status": "running",
             "current_run_id": task_id,
+            "first_run_id": task_id,
             "agent": None,
             "browser": None,
             "queue": [],
@@ -2296,6 +2422,90 @@ async def cancel_queued_message(
     return {"success": True}
 
 
+_FORM_VALUES_JS = """() => {
+  const label = (el) => {
+    if (el.getAttribute('aria-label')) return el.getAttribute('aria-label');
+    if (el.id) { const l = document.querySelector('label[for="' + CSS.escape(el.id) + '"]'); if (l) return l.innerText.trim(); }
+    const w = el.closest('label'); if (w) return w.innerText.trim();
+    return '';
+  };
+  const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const fields = [...document.querySelectorAll('input, select, textarea')]
+    .filter((el) => el.type !== 'hidden' && visible(el))
+    .map((el) => ({
+      id: el.id || null, name: el.name || null, type: el.type || el.tagName.toLowerCase(),
+      label: label(el).slice(0, 120),
+      value: el.tagName === 'SELECT' ? ((el.selectedOptions[0] || {}).text || '') : el.value,
+      checked: (el.type === 'checkbox' || el.type === 'radio') ? el.checked : null,
+      group: el.type === 'radio' ? (((el.closest('.check-row') || {}).innerText || '').split('\\n')[0] || '').trim().slice(0, 160) : null,
+    }));
+  const h = document.querySelector('.step-heading') || document.querySelector('h1, h2');
+  return JSON.stringify({ url: location.href, heading: h ? h.innerText.trim() : null, fields });
+}"""
+
+
+@app.get("/api/v1/sessions/{session_id}/form-values")
+async def session_form_values(session_id: str, user_id: str = Depends(get_user_id)):
+    """Read the actual values of every visible form control on the session's current page.
+
+    Lets callers VERIFY a fill from the DOM instead of trusting the agent's own report (which has
+    claimed fields were filled when they were empty). Read-only; runs a fixed script.
+    """
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Session has an active run")
+    agent = session.get("agent")
+    browser_session = getattr(agent, "browser_session", None) if agent else None
+    if browser_session is None:
+        raise HTTPException(status_code=409, detail="Session has no open browser")
+    page = await browser_session.get_current_page()
+    if page is None:
+        raise HTTPException(status_code=409, detail="No open page")
+    raw = await page.evaluate(_FORM_VALUES_JS)
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"Unexpected evaluate result: {str(raw)[:200]}")
+
+
+_PAGE_OUTLINE_JS = """() => {
+  const root = document.querySelector('.container') || document.body;
+  const vis = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const text = (root.innerText || '').replace(/\\n{3,}/g, '\\n\\n').slice(0, 30000);
+  const buttons = [...document.querySelectorAll('button, a.btn, [role=button]')].filter(vis)
+    .map((b) => (b.innerText || b.getAttribute('aria-label') || '').trim()).filter(Boolean).slice(0, 80);
+  const headings = [...document.querySelectorAll('h1, h2, h3, h4, .schedule-section-title')].filter(vis)
+    .map((h) => h.innerText.trim()).filter(Boolean).slice(0, 80);
+  const tables = [...document.querySelectorAll('table')].filter(vis).slice(0, 10)
+    .map((t) => [...t.querySelectorAll('tr')].slice(0, 60).map((r) => [...r.children].map((c) => c.innerText.trim().slice(0, 80)).join(' | ')));
+  return JSON.stringify({ url: location.href, headings, buttons, tables, text });
+}"""
+
+
+@app.get("/api/v1/sessions/{session_id}/page-outline")
+async def session_page_outline(session_id: str, user_id: str = Depends(get_user_id)):
+    """Read-only structural dump of the session's current page (visible text, headings, buttons, tables)."""
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Session has an active run")
+    agent = session.get("agent")
+    browser_session = getattr(agent, "browser_session", None) if agent else None
+    if browser_session is None:
+        raise HTTPException(status_code=409, detail="Session has no open browser")
+    page = await browser_session.get_current_page()
+    if page is None:
+        raise HTTPException(status_code=409, detail="No open page")
+    raw = await page.evaluate(_PAGE_OUTLINE_JS)
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"Unexpected evaluate result: {str(raw)[:200]}")
+
+
 @app.post("/api/v1/sessions/{session_id}/purge")
 async def purge_cloud_session(session_id: str, user_id: str = Depends(get_user_id)):
     session = _sessions.pop(session_id, None)
@@ -2345,9 +2555,18 @@ async def _browser_screenshot_loop(browser_id: str, browser_session: Browser):
 @app.post("/api/v1/browsers")
 async def create_cloud_browser(user_id: str = Depends(get_user_id)):
     browser_id = str(uuid.uuid4())
-    browser_session, _ = configure_browser_profile({})
+    downloads_dir = MEDIA_DIR / f"browser-{browser_id}" / "downloads"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    headful = os.environ.get("BROWSER_USE_HEADFUL", "false").lower() == "true"
+    # Same browser setup as ordinary runs (visible Chrome when configured), but kept alive between
+    # runs so a login survives; runs attach to it with POST /api/v1/runs {"browserId": ...}.
+    browser_session, _info = configure_browser_profile({}, downloads_dir=downloads_dir, keep_alive=True)
     if browser_session is None:
-        browser_session = Browser(browser_profile=BrowserProfile(headless=True))
+        browser_session = Browser(
+            browser_profile=BrowserProfile(
+                headless=not headful, downloads_path=str(downloads_dir), keep_alive=True
+            )
+        )
     await browser_session.start()
 
     _browsers[browser_id] = {
@@ -2404,15 +2623,61 @@ async def get_cloud_browser_downloads(
     user_id: str = Depends(get_user_id),
     cursor: Optional[str] = None,
     limit: int = Query(50, ge=1, le=100),
-    includeUrls: Optional[str] = None,
+    includeUrls: bool = Query(False),
 ):
+    """Matches the real Browser Use Cloud v4 "List Browser Session Downloads"
+    contract (GET /api/v4/browsers/{session_id}/downloads), except `url` is a
+    locally-served URL rather than a presigned S3 URL, since this bridge has
+    no object storage."""
     entry = _browsers.get(browser_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Browser session not found")
 
-    downloaded = getattr(entry["browser"], "downloaded_files", None) or []
-    files = [{"filename": Path(p).name, "path": str(p)} for p in downloaded]
-    return {"files": files, "hasMore": False, "nextCursor": None}
+    downloads_dir = MEDIA_DIR / f"browser-{browser_id}" / "downloads"
+    all_files = (
+        sorted((p for p in downloads_dir.iterdir() if p.is_file()), key=lambda f: f.stat().st_mtime)
+        if downloads_dir.exists()
+        else []
+    )
+
+    start = int(cursor) if cursor else 0
+    page = all_files[start : start + limit]
+    has_more = start + limit < len(all_files)
+
+    files = []
+    for p in page:
+        stat = p.stat()
+        files.append(
+            {
+                "path": p.name,
+                "size": stat.st_size,
+                "lastModified": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat().replace("+00:00", "Z"),
+                "url": f"/api/v1/browsers/{browser_id}/downloads/{p.name}" if includeUrls else None,
+            }
+        )
+
+    return {
+        "files": files,
+        "hasMore": has_more,
+        "nextCursor": str(start + limit) if has_more else None,
+    }
+
+
+@app.get("/api/v1/browsers/{browser_id}/downloads/{filename}")
+async def get_browser_download_file(
+    browser_id: str, filename: str, user_id: str = Depends(get_user_id)
+):
+    """Serves a file previously downloaded during a standalone browser session."""
+    entry = _browsers.get(browser_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Browser session not found")
+
+    file_path = MEDIA_DIR / f"browser-{browser_id}" / "downloads" / filename
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Download not found")
+
+    content_type, _ = mimetypes.guess_type(file_path)
+    return FileResponse(file_path, media_type=content_type or "application/octet-stream", filename=filename)
 
 
 @app.get("/live/browser/{browser_id}", response_class=HTMLResponse)
@@ -2601,6 +2866,37 @@ async def live_view(task_id: str, user_id: str = Depends(get_user_id)):
 async def ping():
     """Health check endpoint"""
     return {"status": "success", "message": "API is running"}
+
+
+@app.post("/api/v1/pdf/layout-text")
+async def pdf_layout_text(request: Request):
+    """Extract layout-preserving text from a PDF sent as the raw request body.
+
+    Used by the n8n T2 filing workflow: flattened/generated tax-return PDFs keep their
+    filled-in values in the text layer, but n8n's built-in PDF extractor scrambles the reading
+    order and drops them. `pdftotext -layout` keeps each value next to its label.
+    Returns {"pageCount": n, "pages": [text, ...]} (one string per page).
+    """
+    body = await request.body()
+    if not body.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Request body must be a PDF")
+    proc = await asyncio.create_subprocess_exec(
+        "/usr/local/bin/pdftotext", "-layout", "-", "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(body), timeout=60)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise HTTPException(status_code=504, detail="pdftotext timed out")
+    if proc.returncode != 0:
+        raise HTTPException(status_code=422, detail=f"pdftotext failed: {err.decode(errors='replace')[:200]}")
+    pages = out.decode("utf-8", errors="replace").split("\f")
+    if pages and not pages[-1].strip():
+        pages.pop()
+    return {"pageCount": len(pages), "pages": pages}
 
 
 @app.get("/api/v1/browser-config")

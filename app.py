@@ -131,6 +131,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Browser Use Bridge API", lifespan=lifespan)
 
+
 # Mount static files
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
@@ -429,8 +430,8 @@ def configure_browser_profile(
     downloads_dir: when set, file downloads triggered during this browser's
     session are saved here instead of wherever Chrome's default download
     location is. Callers pass MEDIA_DIR / task_id so downloaded files show
-    up via the existing /api/v1/task/{task_id}/media(/list) endpoints,
-    which already glob that exact directory.
+    up in the run's attachments (GET /api/v4/runs/{run_id}/attachments),
+    which glob that exact directory.
     """
     # Configure browser headless/headful mode (task setting overrides env var)
     task_headful = task_browser_config.get("headful")
@@ -1248,13 +1249,8 @@ async def execute_task(
     ai_provider: str,
     user_id: str = DEFAULT_USER_ID,
     session_id: Optional[str] = None,
-    browser_override: Optional[Browser] = None,
 ):
     """Execute browser task in background - main orchestration function
-
-    browser_override: a standalone browser (POST /api/v1/browsers, keep_alive) to drive instead of
-    launching a fresh one. It is left open when the run ends, so cookies/login/page state persist
-    across runs - unlike session continuations, whose browser is reset between runs.
 
     Chrome paths (CHROME_PATH and CHROME_USER_DATA) are only sourced from
     environment variables for security reasons.
@@ -1286,15 +1282,12 @@ async def execute_task(
         # object (see _run_session_continuation) rather than recreating the
         # profile, so every download for the whole session lands here, not
         # under each individual continuation's own task_id.
-        if browser_override is not None:
-            browser, browser_info = browser_override, {"standalone_browser": True}
-        else:
-            # Session-owned browsers must survive between runs (login, cookies, current page); without
-            # keep_alive the agent resets the browser when each run ends, so a follow-up message in the
-            # same session would find a blank tab.
-            browser, browser_info = configure_browser_profile(
-                task_browser_config, downloads_dir=MEDIA_DIR / task_id, keep_alive=bool(session_id)
-            )
+        # Session-owned browsers must survive between runs (login, cookies, current page); without
+        # keep_alive the agent resets the browser when each run ends, so a follow-up message in the
+        # same session would find a blank tab.
+        browser, browser_info = configure_browser_profile(
+            task_browser_config, downloads_dir=MEDIA_DIR / task_id, keep_alive=bool(session_id)
+        )
         logger.info(f"Task {task_id}: Browser configuration: {browser_info}")
 
         # Create agent
@@ -1563,8 +1556,6 @@ async def execute_task(
     finally:
         if session_id:
             await _park_session_browser(session_id, agent, browser, user_id)
-        elif browser_override is not None:
-            logger.info(f"Task {task_id}: standalone browser left open")
         else:
             await cleanup_task(browser, task_id, user_id)
 
@@ -1622,7 +1613,6 @@ def _new_task_record(
     return live_url
 
 
-@app.post("/api/v1/run-task", response_model=TaskResponse)
 async def run_task(
     request: TaskRequest,
     user_id: str = Depends(get_user_id),
@@ -1767,67 +1757,6 @@ async def automated_screenshot(agent, task_id, user_id=DEFAULT_USER_ID):
         logger.error(f"Error in automated_screenshot for task {task_id}: {str(e)}")
 
 
-@app.get("/api/v1/task/{task_id}/status", response_model=TaskStatusResponse)
-async def get_task_status(task_id: str, user_id: str = Depends(get_user_id)):
-    """Get status of a task"""
-    task = task_storage.get_task(task_id, user_id)
-
-    agent = task_storage.get_task_agent(task_id, user_id)
-
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # Optional step tracking on status polling (off by default for performance)
-    if task["status"] == TaskStatus.RUNNING and STATUS_TRACK_STEPS_ON_POLL:
-        # Initialize steps array if not present
-        current_step = len(task.get("steps", [])) + 1
-
-        # Add step info
-        step_info = {
-            "step": current_step,
-            "timestamp": datetime.now(UTC).isoformat() + "Z",
-            "next_goal": f"Progress check {current_step}",
-            "evaluation_previous_goal": "In progress",
-        }
-
-        task_storage.add_task_step(task_id, step_info, user_id)
-        logger.info(f"Added step {current_step} for task {task_id}")
-        add_trajectory_event(
-            task_id,
-            user_id,
-            "step",
-            {
-                "step": current_step,
-                "next_goal": step_info.get("next_goal"),
-                "evaluation_previous_goal": step_info.get("evaluation_previous_goal"),
-            },
-        )
-
-    if STATUS_CAPTURE_SCREENSHOT:
-        now_epoch = datetime.now(UTC).timestamp()
-        last_capture_epoch = task.get("last_status_capture_epoch") or 0
-        if (
-            now_epoch - float(last_capture_epoch)
-            >= STATUS_SCREENSHOT_MIN_INTERVAL_SECONDS
-        ):
-            try:
-                _ = agent.browser_session
-                await capture_screenshot(agent, task_id, user_id)
-                task_storage.update_task(
-                    task_id, {"last_status_capture_epoch": now_epoch}, user_id
-                )
-            except (AssertionError, AttributeError):
-                logger.info(
-                    f"BrowserSession not ready for task {task_id}, skipping screenshot."
-                )
-
-    return TaskStatusResponse(
-        status=task["status"],
-        result=task.get("output"),
-        error=task.get("error"),
-    )
-
-
 async def capture_screenshot(agent_or_context, task_id, user_id=DEFAULT_USER_ID):
     """Capture screenshot with flexible input handling and duplicate detection"""
     logger.info(f"Capturing screenshot for task: {task_id}")
@@ -1912,63 +1841,6 @@ async def capture_screenshot(agent_or_context, task_id, user_id=DEFAULT_USER_ID)
         logger.error(f"Error in capture_screenshot for task {task_id}: {str(e)}")
 
 
-@app.get("/api/v1/task/{task_id}", response_model=dict)
-async def get_task(task_id: str, user_id: str = Depends(get_user_id)):
-    """Get full task details"""
-    task = task_storage.get_task(task_id, user_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    return task
-
-
-@app.post("/api/v1/task/{task_id}/reward")
-async def set_task_reward(
-    task_id: str,
-    request: RewardRequest,
-    user_id: str = Depends(get_user_id),
-):
-    """Set a manual reward score for a task and override effective reward."""
-    task = task_storage.get_task(task_id, user_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    reward = task.get("reward", {})
-    auto_score = reward.get("auto_score") if isinstance(reward, dict) else None
-    manual_score = request.manual_score
-    now = datetime.now(UTC).isoformat() + "Z"
-
-    task_storage.set_task_reward(
-        task_id,
-        {
-            "auto_score": auto_score,
-            "manual_score": manual_score,
-            "effective_score": manual_score,
-            "source": "manual",
-            "reason": request.reason,
-            "updated_at": now,
-        },
-        user_id,
-    )
-    add_trajectory_event(
-        task_id,
-        user_id,
-        "reward_manual",
-        {
-            "score": manual_score,
-            "reason": request.reason,
-        },
-    )
-
-    updated_task = task_storage.get_task(task_id, user_id)
-    return {
-        "message": "Reward updated",
-        "task_id": task_id,
-        "reward": updated_task.get("reward", {}),
-    }
-
-
-@app.put("/api/v1/stop-task/{task_id}")
 async def stop_task(task_id: str, user_id: str = Depends(get_user_id)):
     """Stop a running task"""
     task = task_storage.get_task(task_id, user_id)
@@ -1993,58 +1865,6 @@ async def stop_task(task_id: str, user_id: str = Depends(get_user_id)):
         task_storage.update_task_status(task_id, TaskStatus.STOPPED, user_id)
         task_storage.mark_task_finished(task_id, user_id, TaskStatus.STOPPED)
         return {"message": "Task stopped (no agent found)"}
-
-
-@app.put("/api/v1/pause-task/{task_id}")
-async def pause_task(task_id: str, user_id: str = Depends(get_user_id)):
-    """Pause a running task"""
-    task = task_storage.get_task(task_id, user_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    if task["status"] != TaskStatus.RUNNING:
-        return {"message": f"Task not running: {task['status']}"}
-
-    # Get agent
-    agent = task_storage.get_task_agent(task_id, user_id)
-    if agent:
-        # Call agent's pause method
-        agent.pause()
-        task_storage.update_task_status(task_id, TaskStatus.PAUSED, user_id)
-        return {"message": "Task paused"}
-    else:
-        return {"message": "Task could not be paused (no agent found)"}
-
-
-@app.put("/api/v1/resume-task/{task_id}")
-async def resume_task(task_id: str, user_id: str = Depends(get_user_id)):
-    """Resume a paused task"""
-    task = task_storage.get_task(task_id, user_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    if task["status"] != TaskStatus.PAUSED:
-        return {"message": f"Task not paused: {task['status']}"}
-
-    # Get agent
-    agent = task_storage.get_task_agent(task_id, user_id)
-    if agent:
-        # Call agent's resume method
-        agent.resume()
-        task_storage.update_task_status(task_id, TaskStatus.RUNNING, user_id)
-        return {"message": "Task resumed"}
-    else:
-        return {"message": "Task could not be resumed (no agent found)"}
-
-
-@app.get("/api/v1/list-tasks")
-async def list_tasks(
-    user_id: str = Depends(get_user_id),
-    page: int = Query(1, ge=1),
-    per_page: int = Query(100, ge=1, le=1000),
-):
-    """List all tasks"""
-    return task_storage.list_tasks(user_id, page, per_page)
 
 
 # --- Browser Use Cloud v4 API compatibility layer ---
@@ -2076,51 +1896,56 @@ def _to_cloud_run_status(local_status: str) -> str:
 
 
 def _task_to_cloud_run(task: dict) -> dict:
+    """Browser Use Cloud v4 RunSummary (the fields this bridge can fill)."""
     return {
         "id": task["id"],
-        "status": _to_cloud_run_status(task["status"]),
         "task": task.get("task"),
+        "status": _to_cloud_run_status(task["status"]),
+        "model": os.environ.get("OPENAI_MODEL_ID") or task.get("ai_provider"),
         "result": task.get("output"),
+        "output": task.get("output"),
         "error": task.get("error"),
+        "sessionId": task.get("session_id"),
+        "workspaceId": None,
         "createdAt": task.get("created_at"),
+        "finishedAt": task.get("finished_at"),
     }
 
 
-@app.get("/api/v1/tasks")
+def _run_create_response(run_id: str, task_text: str, session_id: Optional[str] = None) -> dict:
+    """Browser Use Cloud v4 RunCreateResponse."""
+    return {
+        "id": run_id,
+        "status": "queued",
+        "model": os.environ.get("OPENAI_MODEL_ID") or os.environ.get("DEFAULT_AI_PROVIDER", "openai"),
+        "sessionId": session_id,
+        "workspaceId": None,
+        "eventsUrl": f"/api/v4/runs/{run_id}/events",
+    }
+
+
+@app.get("/api/v4/tasks")
 async def cloud_tasks_probe():
     """Dummy endpoint the n8n credential's connection test hits."""
     return {"tasks": []}
 
 
-@app.post("/api/v1/runs")
+@app.post("/api/v4/runs")
 async def create_cloud_run(request: Request, user_id: str = Depends(get_user_id)):
     body = await request.json()
     task_text = body.get("task")
     if not task_text:
         raise HTTPException(status_code=400, detail='The "task" field is required.')
 
-    browser_id = body.get("browserId")
-    if browser_id:
-        entry = _browsers.get(browser_id)
-        if not entry or entry.get("status") != "running":
-            raise HTTPException(status_code=404, detail="Browser not found or not running")
-        task_id = str(uuid.uuid4())
-        _new_task_record(task_id, task_text, None, user_id)
-        ai_provider = os.environ.get("DEFAULT_AI_PROVIDER", "openai")
-        asyncio.create_task(
-            execute_task(task_id, task_text, ai_provider, user_id, browser_override=entry["browser"])
-        )
-        return {"id": task_id, "status": "created", "task": task_text, "browserId": browser_id}
-
     session_id = body.get("sessionId")
     if session_id:
         return await _create_or_continue_session_run(session_id, task_text, user_id)
 
     response = await run_task(TaskRequest(task=task_text), user_id)
-    return {"id": response.id, "status": _to_cloud_run_status(response.status), "task": task_text}
+    return _run_create_response(response.id, task_text)
 
 
-@app.get("/api/v1/runs/{run_id}")
+@app.get("/api/v4/runs/{run_id}")
 async def get_cloud_run(run_id: str, user_id: str = Depends(get_user_id)):
     task = task_storage.get_task(run_id, user_id)
     if not task:
@@ -2128,7 +1953,7 @@ async def get_cloud_run(run_id: str, user_id: str = Depends(get_user_id)):
     return _task_to_cloud_run(task)
 
 
-@app.get("/api/v1/runs/{run_id}/status")
+@app.get("/api/v4/runs/{run_id}/status")
 async def get_cloud_run_status(run_id: str, user_id: str = Depends(get_user_id)):
     task = task_storage.get_task(run_id, user_id)
     if not task:
@@ -2136,14 +1961,14 @@ async def get_cloud_run_status(run_id: str, user_id: str = Depends(get_user_id))
     return {"id": run_id, "status": _to_cloud_run_status(task["status"])}
 
 
-@app.post("/api/v1/runs/{run_id}/cancel")
+@app.post("/api/v4/runs/{run_id}/cancel")
 async def cancel_cloud_run(run_id: str, user_id: str = Depends(get_user_id)):
     await stop_task(run_id, user_id)
     task = task_storage.get_task(run_id, user_id)
     return _task_to_cloud_run(task)
 
 
-@app.get("/api/v1/runs")
+@app.get("/api/v4/runs")
 async def list_cloud_runs(
     user_id: str = Depends(get_user_id),
     cursor: Optional[str] = None,
@@ -2160,7 +1985,7 @@ async def list_cloud_runs(
     }
 
 
-@app.get("/api/v1/runs/{run_id}/events")
+@app.get("/api/v4/runs/{run_id}/events")
 async def get_cloud_run_events(run_id: str, user_id: str = Depends(get_user_id)):
     if not task_storage.task_exists(run_id, user_id):
         raise HTTPException(status_code=404, detail="Run not found")
@@ -2168,11 +1993,11 @@ async def get_cloud_run_events(run_id: str, user_id: str = Depends(get_user_id))
     return {"events": [], "hasMore": False, "nextAfter": None}
 
 
-@app.get("/api/v1/runs/{run_id}/attachments")
+@app.get("/api/v4/runs/{run_id}/attachments")
 async def get_cloud_run_attachments(run_id: str, user_id: str = Depends(get_user_id)):
     media = await list_task_media(run_id, user_id)
     attachments = [
-        {"id": item["filename"], "filename": item["filename"], "url": item["url"]}
+        {"id": item["filename"], "filename": item["filename"], "url": f"/api/v4{item['url']}"}
         for item in media.get("media", [])
     ]
     return {"attachments": attachments}
@@ -2185,14 +2010,22 @@ async def get_cloud_run_attachments(run_id: str, user_id: str = Depends(get_user
 _sessions: dict = {}
 
 
+_SESSION_STATUS_TO_CLOUD = {"running": "running", "idle": "completed", "failed": "failed"}
+
+
 def _session_to_cloud(session: dict) -> dict:
+    """Browser Use Cloud v4 SessionInfo. `sessionId` is whatever string the caller chose (the real cloud wants a UUID)."""
+    latest = session.get("current_run_id") or session.get("latest_run_id")
+    task = task_storage.get_task(latest, session.get("user_id")) if latest else None
     return {
-        "id": session["id"],
-        "status": session["status"],
-        "currentRunId": session["current_run_id"],
-        # Downloads for the whole session land under the FIRST run's media dir (see execute_task).
-        "firstRunId": session.get("first_run_id"),
+        "sessionId": session["id"],
+        "workspaceId": None,
+        "latestRunId": latest,
+        "task": (task or {}).get("task"),
+        "title": None,
+        "status": _SESSION_STATUS_TO_CLOUD.get(session["status"], session["status"]),
         "createdAt": session["created_at"],
+        "updatedAt": (task or {}).get("finished_at") or (task or {}).get("created_at") or session["created_at"],
     }
 
 
@@ -2294,6 +2127,7 @@ async def _drain_session_queue(session_id: str, user_id: str):
     message["run_id"] = task_id
     session["status"] = "running"
     session["current_run_id"] = task_id
+    session["latest_run_id"] = task_id
     await _run_session_continuation(session_id, task_id, message["text"], user_id)
 
 
@@ -2318,6 +2152,7 @@ async def _create_or_continue_session_run(session_id: str, task_text: str, user_
             "ai_provider": None,
             "status": "running",
             "current_run_id": task_id,
+            "latest_run_id": task_id,
             "first_run_id": task_id,
             "agent": None,
             "browser": None,
@@ -2331,7 +2166,7 @@ async def _create_or_continue_session_run(session_id: str, task_text: str, user_
         asyncio.create_task(
             execute_task(task_id, task_text, ai_provider, user_id, session_id=session_id)
         )
-        return {"id": task_id, "status": "created", "task": task_text, "sessionId": session_id}
+        return _run_create_response(task_id, task_text, session_id)
 
     # Idle session: continue in the same browser instead of starting a new one.
     task_id = str(uuid.uuid4())
@@ -2340,11 +2175,12 @@ async def _create_or_continue_session_run(session_id: str, task_text: str, user_
     )
     session["status"] = "running"
     session["current_run_id"] = task_id
+    session["latest_run_id"] = task_id
     asyncio.create_task(_run_session_continuation(session_id, task_id, task_text, user_id))
-    return {"id": task_id, "status": "created", "task": task_text, "sessionId": session_id}
+    return _run_create_response(task_id, task_text, session_id)
 
 
-@app.get("/api/v1/sessions/{session_id}")
+@app.get("/api/v4/sessions/{session_id}")
 async def get_cloud_session(session_id: str, user_id: str = Depends(get_user_id)):
     session = _sessions.get(session_id)
     if not session:
@@ -2352,7 +2188,7 @@ async def get_cloud_session(session_id: str, user_id: str = Depends(get_user_id)
     return _session_to_cloud(session)
 
 
-@app.get("/api/v1/sessions")
+@app.get("/api/v4/sessions")
 async def list_cloud_sessions(
     user_id: str = Depends(get_user_id),
     cursor: Optional[str] = None,
@@ -2371,7 +2207,7 @@ async def list_cloud_sessions(
     }
 
 
-@app.post("/api/v1/sessions/{session_id}/queue")
+@app.post("/api/v4/sessions/{session_id}/queue")
 async def queue_session_message(
     session_id: str, request: Request, user_id: str = Depends(get_user_id)
 ):
@@ -2394,7 +2230,7 @@ async def queue_session_message(
     return {"id": message_id, "sessionId": session_id, "status": "queued"}
 
 
-@app.get("/api/v1/sessions/{session_id}/queue")
+@app.get("/api/v4/sessions/{session_id}/queue")
 async def get_session_queue(session_id: str, user_id: str = Depends(get_user_id)):
     session = _sessions.get(session_id)
     if not session:
@@ -2407,7 +2243,7 @@ async def get_session_queue(session_id: str, user_id: str = Depends(get_user_id)
     }
 
 
-@app.delete("/api/v1/sessions/{session_id}/queue/{message_id}")
+@app.delete("/api/v4/sessions/{session_id}/queue/{message_id}")
 async def cancel_queued_message(
     session_id: str, message_id: int, user_id: str = Depends(get_user_id)
 ):
@@ -2444,7 +2280,7 @@ _FORM_VALUES_JS = """() => {
 }"""
 
 
-@app.get("/api/v1/sessions/{session_id}/form-values")
+@app.get("/api/v4/sessions/{session_id}/form-values")
 async def session_form_values(session_id: str, user_id: str = Depends(get_user_id)):
     """Read the actual values of every visible form control on the session's current page.
 
@@ -2484,7 +2320,7 @@ _PAGE_OUTLINE_JS = """() => {
 }"""
 
 
-@app.get("/api/v1/sessions/{session_id}/page-outline")
+@app.get("/api/v4/sessions/{session_id}/page-outline")
 async def session_page_outline(session_id: str, user_id: str = Depends(get_user_id)):
     """Read-only structural dump of the session's current page (visible text, headings, buttons, tables)."""
     session = _sessions.get(session_id)
@@ -2506,7 +2342,7 @@ async def session_page_outline(session_id: str, user_id: str = Depends(get_user_
         raise HTTPException(status_code=502, detail=f"Unexpected evaluate result: {str(raw)[:200]}")
 
 
-@app.post("/api/v1/sessions/{session_id}/purge")
+@app.post("/api/v4/sessions/{session_id}/purge")
 async def purge_cloud_session(session_id: str, user_id: str = Depends(get_user_id)):
     session = _sessions.pop(session_id, None)
     if not session:
@@ -2529,11 +2365,22 @@ BROWSER_SCREENSHOT_INTERVAL_SECONDS = 3
 
 
 def _browser_to_cloud(entry: dict) -> dict:
+    """Browser Use Cloud v4 BrowserSessionView (cost/proxy fields are always zero: nothing is metered locally)."""
+    stopped = entry["status"] == "stopped"
     return {
         "id": entry["id"],
-        "status": entry["status"],
+        "status": "stopped" if stopped else "active",
         "liveUrl": f"/live/browser/{entry['id']}",
-        "createdAt": entry["created_at"],
+        "cdpUrl": None,
+        "timeoutAt": None,
+        "startedAt": entry["created_at"],
+        "finishedAt": entry.get("finished_at"),
+        "proxyUsedMb": "0",
+        "proxyCost": "0",
+        "browserCost": "0",
+        "agentSessionId": None,
+        "recordingUrl": None,
+        "metadata": {},
     }
 
 
@@ -2552,14 +2399,13 @@ async def _browser_screenshot_loop(browser_id: str, browser_session: Browser):
         await asyncio.sleep(BROWSER_SCREENSHOT_INTERVAL_SECONDS)
 
 
-@app.post("/api/v1/browsers")
+@app.post("/api/v4/browsers")
 async def create_cloud_browser(user_id: str = Depends(get_user_id)):
     browser_id = str(uuid.uuid4())
     downloads_dir = MEDIA_DIR / f"browser-{browser_id}" / "downloads"
     downloads_dir.mkdir(parents=True, exist_ok=True)
     headful = os.environ.get("BROWSER_USE_HEADFUL", "false").lower() == "true"
-    # Same browser setup as ordinary runs (visible Chrome when configured), but kept alive between
-    # runs so a login survives; runs attach to it with POST /api/v1/runs {"browserId": ...}.
+    # Same browser setup as ordinary runs (visible Chrome when configured), kept alive until stopped.
     browser_session, _info = configure_browser_profile({}, downloads_dir=downloads_dir, keep_alive=True)
     if browser_session is None:
         browser_session = Browser(
@@ -2580,7 +2426,7 @@ async def create_cloud_browser(user_id: str = Depends(get_user_id)):
     return _browser_to_cloud(_browsers[browser_id])
 
 
-@app.get("/api/v1/browsers/{browser_id}")
+@app.get("/api/v4/browsers/{browser_id}")
 async def get_cloud_browser(browser_id: str, user_id: str = Depends(get_user_id)):
     entry = _browsers.get(browser_id)
     if not entry:
@@ -2588,7 +2434,7 @@ async def get_cloud_browser(browser_id: str, user_id: str = Depends(get_user_id)
     return _browser_to_cloud(entry)
 
 
-@app.get("/api/v1/browsers")
+@app.get("/api/v4/browsers")
 async def list_cloud_browsers(
     user_id: str = Depends(get_user_id),
     pageNumber: int = Query(1, ge=1),
@@ -2603,13 +2449,14 @@ async def list_cloud_browsers(
     }
 
 
-@app.patch("/api/v1/browsers/{browser_id}")
+@app.patch("/api/v4/browsers/{browser_id}")
 async def stop_cloud_browser(browser_id: str, user_id: str = Depends(get_user_id)):
     entry = _browsers.get(browser_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Browser session not found")
 
     entry["status"] = "stopped"
+    entry["finished_at"] = datetime.now(UTC).isoformat() + "Z"
     try:
         await entry["browser"].stop()
     except Exception as e:
@@ -2617,7 +2464,7 @@ async def stop_cloud_browser(browser_id: str, user_id: str = Depends(get_user_id
     return _browser_to_cloud(entry)
 
 
-@app.get("/api/v1/browsers/{browser_id}/downloads")
+@app.get("/api/v4/browsers/{browser_id}/downloads")
 async def get_cloud_browser_downloads(
     browser_id: str,
     user_id: str = Depends(get_user_id),
@@ -2652,7 +2499,7 @@ async def get_cloud_browser_downloads(
                 "path": p.name,
                 "size": stat.st_size,
                 "lastModified": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat().replace("+00:00", "Z"),
-                "url": f"/api/v1/browsers/{browser_id}/downloads/{p.name}" if includeUrls else None,
+                "url": f"/api/v4/browsers/{browser_id}/downloads/{p.name}" if includeUrls else None,
             }
         )
 
@@ -2663,7 +2510,7 @@ async def get_cloud_browser_downloads(
     }
 
 
-@app.get("/api/v1/browsers/{browser_id}/downloads/{filename}")
+@app.get("/api/v4/browsers/{browser_id}/downloads/{filename}")
 async def get_browser_download_file(
     browser_id: str, filename: str, user_id: str = Depends(get_user_id)
 ):
@@ -2686,7 +2533,7 @@ async def browser_live_view(browser_id: str, user_id: str = Depends(get_user_id)
     if browser_id not in _browsers:
         raise HTTPException(status_code=404, detail="Browser session not found")
 
-    img_url = f"/api/v1/media/browser-{browser_id}/latest.png"
+    img_url = f"/api/v4/media/browser-{browser_id}/latest.png"
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -2716,143 +2563,80 @@ async def live_view(task_id: str, user_id: str = Depends(get_user_id)):
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Browser Use Task {task_id}</title>
+        <title>Browser Use Run {task_id}</title>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
             body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; }}
             .container {{ max-width: 1200px; margin: 0 auto; }}
             .status {{ padding: 10px; border-radius: 4px; margin-bottom: 20px; }}
-            .{TaskStatus.RUNNING} {{ background-color: #e3f2fd; }}
-            .{TaskStatus.FINISHED} {{ background-color: #e8f5e9; }}
-            .{TaskStatus.FAILED} {{ background-color: #ffebee; }}
-            .{TaskStatus.PAUSED} {{ background-color: #fff8e1; }}
-            .{TaskStatus.STOPPED} {{ background-color: #eeeeee; }}
-            .{TaskStatus.CREATED} {{ background-color: #f3e5f5; }}
-            .{TaskStatus.STOPPING} {{ background-color: #fce4ec; }}
+            .queued {{ background-color: #f3e5f5; }}
+            .running {{ background-color: #e3f2fd; }}
+            .completed {{ background-color: #e8f5e9; }}
+            .failed {{ background-color: #ffebee; }}
+            .cancelled {{ background-color: #eeeeee; }}
             .controls {{ margin-bottom: 20px; }}
             button {{ padding: 8px 16px; margin-right: 10px; cursor: pointer; }}
-            pre {{ background-color: #f5f5f5; padding: 15px; border-radius: 4px; overflow: auto; }}
-            .step {{ margin-bottom: 10px; padding: 10px; border: 1px solid #ddd; border-radius: 4px; }}
+            pre {{ background-color: #f5f5f5; padding: 15px; border-radius: 4px; overflow: auto; white-space: pre-wrap; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>Browser Use Task</h1>
+            <h1>Browser Use Run</h1>
             <div id="status" class="status">Loading...</div>
-            
+
             <div class="controls">
-                <button id="pauseBtn">Pause</button>
-                <button id="resumeBtn">Resume</button>
-                <button id="stopBtn">Stop</button>
+                <button id="cancelBtn">Cancel run</button>
             </div>
-            
+
             <h2>Result</h2>
             <pre id="result">Loading...</pre>
-            
-            <h2>Steps</h2>
-            <div id="steps">Loading...</div>
-            
+
             <script>
-                const taskId = '{task_id}';
-                const FINISHED = '{TaskStatus.FINISHED}';
-                const FAILED = '{TaskStatus.FAILED}';
-                const STOPPED = '{TaskStatus.STOPPED}';
+                const runId = '{task_id}';
+                const TERMINAL = ['completed', 'failed', 'cancelled'];
                 const userId = '{user_id}';
-                
+
                 // Set user ID in request headers if available
                 const headers = {{}};
                 if (userId && userId !== 'default') {{
                     headers['X-User-ID'] = userId;
                 }}
-                
-                // Update status function
+
                 function updateStatus() {{
-                    fetch(`/api/v1/task/${{taskId}}/status`, {{ headers }})
+                    fetch(`/api/v4/runs/${{runId}}`, {{ headers }})
                         .then(response => response.json())
                         .then(data => {{
-                            // Update status element
                             const statusEl = document.getElementById('status');
                             statusEl.textContent = `Status: ${{data.status}}`;
                             statusEl.className = `status ${{data.status}}`;
-                            
-                            // Update result if available
+
                             if (data.result) {{
                                 document.getElementById('result').textContent = data.result;
                             }} else if (data.error) {{
                                 document.getElementById('result').textContent = `Error: ${{data.error}}`;
                             }}
-                            
-                            // Continue polling if not in terminal state
-                            if (![FINISHED, FAILED, STOPPED].includes(data.status)) {{
+
+                            if (!TERMINAL.includes(data.status)) {{
                                 setTimeout(updateStatus, 2000);
                             }}
                         }})
                         .catch(error => {{
-                            console.error('Error fetching status:', error);
+                            console.error('Error fetching run:', error);
                             setTimeout(updateStatus, 5000);
                         }});
-                        
-                    // Also fetch full task to get steps
-                    fetch(`/api/v1/task/${{taskId}}`, {{ headers }})
-                        .then(response => response.json())
-                        .then(data => {{
-                            if (data.steps && data.steps.length > 0) {{
-                                const stepsHtml = data.steps.map(step => `
-                                    <div class="step">
-                                        <strong>Step ${{step.step}}</strong>
-                                        <p>Next Goal: ${{step.next_goal || 'N/A'}}</p>
-                                        <p>Evaluation: ${{step.evaluation_previous_goal || 'N/A'}}</p>
-                                    </div>
-                                `).join('');
-                                document.getElementById('steps').innerHTML = stepsHtml;
-                            }} else {{
-                                document.getElementById('steps').textContent = 'No steps recorded yet.';
-                            }}
-                        }})
-                        .catch(error => {{
-                            console.error('Error fetching task details:', error);
-                        }});
                 }}
-                
-                // Setup control buttons
-                document.getElementById('pauseBtn').addEventListener('click', () => {{
-                    fetch(`/api/v1/pause-task/${{taskId}}`, {{ 
-                        method: 'PUT',
-                        headers
-                    }})
-                        .then(response => response.json())
-                        .then(data => alert(data.message))
-                        .catch(error => console.error('Error pausing task:', error));
-                }});
-                
-                document.getElementById('resumeBtn').addEventListener('click', () => {{
-                    fetch(`/api/v1/resume-task/${{taskId}}`, {{ 
-                        method: 'PUT',
-                        headers
-                    }})
-                        .then(response => response.json())
-                        .then(data => alert(data.message))
-                        .catch(error => console.error('Error resuming task:', error));
-                }});
-                
-                document.getElementById('stopBtn').addEventListener('click', () => {{
-                    if (confirm('Are you sure you want to stop this task? This action cannot be undone.')) {{
-                        fetch(`/api/v1/stop-task/${{taskId}}`, {{ 
-                            method: 'PUT',
-                            headers
-                        }})
+
+                document.getElementById('cancelBtn').addEventListener('click', () => {{
+                    if (confirm('Cancel this run? This cannot be undone.')) {{
+                        fetch(`/api/v4/runs/${{runId}}/cancel`, {{ method: 'POST', headers }})
                             .then(response => response.json())
-                            .then(data => alert(data.message))
-                            .catch(error => console.error('Error stopping task:', error));
+                            .then(data => alert(`Run ${{data.status}}`))
+                            .catch(error => console.error('Error cancelling run:', error));
                     }}
                 }});
-                
-                // Start status updates
+
                 updateStatus();
-                
-                // Refresh every 5 seconds
-                setInterval(updateStatus, 5000);
             </script>
         </div>
     </body>
@@ -2862,13 +2646,13 @@ async def live_view(task_id: str, user_id: str = Depends(get_user_id)):
     return HTMLResponse(content=html_content)
 
 
-@app.get("/api/v1/ping")
+@app.get("/api/v4/ping")
 async def ping():
     """Health check endpoint"""
     return {"status": "success", "message": "API is running"}
 
 
-@app.post("/api/v1/pdf/layout-text")
+@app.post("/api/v4/pdf/layout-text")
 async def pdf_layout_text(request: Request):
     """Extract layout-preserving text from a PDF sent as the raw request body.
 
@@ -2899,7 +2683,7 @@ async def pdf_layout_text(request: Request):
     return {"pageCount": len(pages), "pages": pages}
 
 
-@app.get("/api/v1/browser-config")
+@app.get("/api/v4/browser-config")
 async def browser_config():
     """Get current browser configuration
 
@@ -2920,83 +2704,6 @@ async def browser_config():
     }
 
 
-@app.get("/api/v1/task/{task_id}/media")
-async def get_task_media(
-    task_id: str, user_id: str = Depends(get_user_id), type: Optional[str] = None
-):
-    """Returns links to any recordings or media generated during task execution"""
-    task = task_storage.get_task(task_id, user_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # Check if task is completed
-    if task["status"] not in [
-        TaskStatus.FINISHED,
-        TaskStatus.FAILED,
-        TaskStatus.STOPPED,
-    ]:
-        raise HTTPException(
-            status_code=400, detail="Media only available for completed tasks"
-        )
-
-    # Check if the media directory exists and contains files
-    task_media_dir = MEDIA_DIR / task_id
-    media_files = []
-
-    if task_media_dir.exists():
-        media_files = list(task_media_dir.glob("*"))
-        logger.info(
-            f"Media directory for task {task_id} contains {len(media_files)} files: {[f.name for f in media_files]}"
-        )
-    else:
-        logger.warning(f"Media directory for task {task_id} does not exist")
-
-    # If we have files but no media entries, create them now
-    if media_files and (not task.get("media") or len(task.get("media", [])) == 0):
-        for file_path in media_files:
-            if file_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
-                file_url = f"/media/{task_id}/{file_path.name}"
-                media_entry = {
-                    "url": file_url,
-                    "type": "screenshot",
-                    "filename": file_path.name,
-                }
-                task_storage.add_task_media(task_id, media_entry, user_id)
-
-    # Get updated task with media
-    task = task_storage.get_task(task_id, user_id)
-    if task is not None:
-        media_list = task.get("media", [])
-    else:
-        media_list = []
-
-    # Filter by type if specified
-    if type and isinstance(media_list, list):
-        if all(isinstance(item, dict) for item in media_list):
-            # Dictionary format with type info
-            media_list = [item for item in media_list if item.get("type") == type]
-            recordings = [item["url"] for item in media_list]
-        else:
-            # Just URLs without type info
-            recordings = []
-            logger.warning(
-                f"Media list for task {task_id} doesn't contain type information"
-            )
-    else:
-        # Return all media
-        if isinstance(media_list, list):
-            if media_list and all(isinstance(item, dict) for item in media_list):
-                recordings = [item["url"] for item in media_list]
-            else:
-                recordings = media_list
-        else:
-            recordings = []
-
-    logger.info(f"Returning {len(recordings)} media items for task {task_id}")
-    return {"recordings": recordings}
-
-
-@app.get("/api/v1/task/{task_id}/media/list")
 async def list_task_media(
     task_id: str, user_id: str = Depends(get_user_id), type: Optional[str] = None
 ):
@@ -3047,7 +2754,7 @@ async def list_task_media(
     return {"media": media_info, "count": len(media_info)}
 
 
-@app.get("/api/v1/media/{task_id}/{filename}")
+@app.get("/api/v4/media/{task_id}/{filename}")
 async def get_media_file(
     task_id: str,
     filename: str,
@@ -3077,78 +2784,6 @@ async def get_media_file(
     return FileResponse(
         path=file_path, media_type=content_type, headers=headers, filename=filename
     )
-
-
-@app.get("/api/v1/test-screenshot")
-async def test_screenshot(ai_provider: str = "google"):
-    """Test endpoint to verify screenshot functionality using refactored utility functions"""
-    logger.info(f"Testing screenshot functionality with provider: {ai_provider}")
-
-    browser = None
-    try:
-        # Use our get_llm utility (fallback for test providers)
-        if ai_provider.lower() == "google":
-            llm = ChatGoogle(model="gemini-1.5-flash")
-        elif ai_provider.lower() == "openai":
-            llm = ChatOpenAI(model="gpt-4o")
-        else:
-            # Use our standard get_llm function for consistency
-            llm = get_llm(ai_provider)
-
-        # Use our configure_browser_profile utility
-        test_browser_config = {"headful": False}  # Force headless for testing
-        browser, browser_info = configure_browser_profile(test_browser_config)
-        logger.info(f"Test browser configuration: {browser_info}")
-
-        # Use our create_agent_config utility
-        task_instruction = "Navigate to example.com and take a screenshot"
-        sensitive_data = get_sensitive_data()
-        agent_config = create_agent_config(
-            task_instruction, llm, sensitive_data, browser
-        )
-
-        agent = Agent(**agent_config)
-
-        # Navigate to test page
-        logger.info("Navigating to example.com for test")
-        await agent.browser_session.navigate_to("https://example.com")
-
-        # Test our capture_screenshot function
-        test_task_id = "screenshot-test"
-        logger.info("Testing screenshot capture with utility function")
-        await capture_screenshot(agent, test_task_id, "test-user")
-
-        # Check results using the same logic but simplified
-        test_media_dir = MEDIA_DIR / test_task_id
-        if test_media_dir.exists():
-            screenshots = list(test_media_dir.glob("*.png"))
-            if screenshots:
-                latest_screenshot = max(screenshots, key=lambda x: x.stat().st_mtime)
-                file_size = latest_screenshot.stat().st_size
-
-                return {
-                    "success": True,
-                    "message": "Screenshot test completed using refactored utilities",
-                    "file_size": file_size,
-                    "file_path": str(latest_screenshot),
-                    "url": f"/media/{test_task_id}/{latest_screenshot.name}",
-                    "utilities_used": [
-                        "configure_browser_profile",
-                        "create_agent_config",
-                        "capture_screenshot",
-                    ],
-                }
-            else:
-                return {"error": "No screenshots found after test"}
-        else:
-            return {"error": "Test media directory not created"}
-
-    except Exception as e:
-        logger.exception("Error in screenshot test")
-        return {"error": f"Test failed: {str(e)}"}
-    finally:
-        # Use our cleanup utility approach
-        await cleanup_task(browser, "screenshot-test", "test-user")
 
 
 async def cleanup_all_tasks():

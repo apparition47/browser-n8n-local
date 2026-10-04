@@ -9,17 +9,15 @@ import requests
 import time
 import sys
 
-def test_api(base_url, task, ai_provider, headful):
+def test_api(base_url, task):
     print(f"Testing Browser Use Bridge API at {base_url}")
     
     # 1. Start a task
     print("\n1. Starting a new task...")
-    payload = {"task": task, "headful": headful}
-    if ai_provider:
-        payload["ai_provider"] = ai_provider
+    payload = {"task": task}
 
     response = requests.post(
-        f"{base_url}/api/v1/run-task",
+        f"{base_url}/api/v4/runs",
         json=payload
     )
     
@@ -37,7 +35,7 @@ def test_api(base_url, task, ai_provider, headful):
     max_polls = 60  # Maximum number of status checks
     for i in range(max_polls):
         print(f"Checking status ({i+1}/{max_polls})...")
-        response = requests.get(f"{base_url}/api/v1/task/{task_id}/status")
+        response = requests.get(f"{base_url}/api/v4/runs/{task_id}/status")
         
         if response.status_code != 200:
             print(f"Error checking status: {response.status_code} {response.text}")
@@ -56,7 +54,7 @@ def test_api(base_url, task, ai_provider, headful):
     
     # 3. Get full task details
     print("\n3. Getting full task details...")
-    response = requests.get(f"{base_url}/api/v1/task/{task_id}")
+    response = requests.get(f"{base_url}/api/v4/runs/{task_id}")
     
     if response.status_code != 200:
         print(f"Error getting task details: {response.status_code} {response.text}")
@@ -70,9 +68,7 @@ def test_api(base_url, task, ai_provider, headful):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test the Browser Use Bridge API")
-    parser.add_argument("--url", default="http://localhost:8000/api/v1", help="Base URL for the API")
+    parser.add_argument("--url", default="http://localhost:8000", help="Bridge base URL (without /api/v4)")
     parser.add_argument("--task", default="Go to google.com and search for 'n8n automation'", help="Task to perform")
-    parser.add_argument("--provider", default=None, choices=["openai", "anthropic", "mistral", "google", "ollama", "deepseek", "azure"], help="AI provider override (omit to use server DEFAULT_AI_PROVIDER)")
-    parser.add_argument("--headful", action="store_true", help="Run the browser in headful mode")
     args = parser.parse_args()
-    sys.exit(test_api(args.url, args.task, args.provider, args.headful)) 
+    sys.exit(test_api(args.url, args.task)) 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a basic task and print summary fields including reward and observation counts."""
+"""Run a basic task through the v4-style Run API and print the summary."""
 
 import argparse
 import json
@@ -9,16 +9,14 @@ import time
 import requests
 
 
-TERMINAL_STATUSES = {"finished", "failed", "stopped"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 
-def run_task(base_url: str, task: str, provider: str | None, headful: bool) -> str:
-    payload = {"task": task, "headful": headful}
-    if provider:
-        payload["ai_provider"] = provider
+def run_task(base_url: str, task: str) -> str:
+    payload = {"task": task}
 
     response = requests.post(
-        f"{base_url}/api/v1/run-task",
+        f"{base_url}/api/v4/runs",
         json=payload,
         timeout=30,
     )
@@ -30,7 +28,7 @@ def wait_for_terminal_status(base_url: str, task_id: str, interval: float, timeo
     started = time.time()
 
     while True:
-        response = requests.get(f"{base_url}/api/v1/task/{task_id}/status", timeout=30)
+        response = requests.get(f"{base_url}/api/v4/runs/{task_id}/status", timeout=30)
         response.raise_for_status()
         data = response.json()
         status = data.get("status")
@@ -53,18 +51,12 @@ def main() -> int:
         default="Go to example.com and report the page title",
         help="Task instruction",
     )
-    parser.add_argument(
-        "--provider",
-        default=None,
-        help="LLM provider override (omit to use DEFAULT_AI_PROVIDER from server .env)",
-    )
-    parser.add_argument("--headful", action="store_true", help="Run browser in headful mode")
     parser.add_argument("--poll-interval", type=float, default=2.0, help="Status poll interval seconds")
     parser.add_argument("--timeout", type=int, default=300, help="Timeout in seconds")
     args = parser.parse_args()
 
     try:
-        task_id = run_task(args.base_url, args.task, args.provider, args.headful)
+        task_id = run_task(args.base_url, args.task)
         print(f"task_id={task_id}")
 
         terminal_status = wait_for_terminal_status(
@@ -75,17 +67,14 @@ def main() -> int:
         )
         print(f"terminal_status={terminal_status.get('status')}")
 
-        task_response = requests.get(f"{args.base_url}/api/v1/task/{task_id}", timeout=30)
+        task_response = requests.get(f"{args.base_url}/api/v4/runs/{task_id}", timeout=30)
         task_response.raise_for_status()
         task_data = task_response.json()
 
         summary = {
             "id": task_data.get("id"),
             "status": task_data.get("status"),
-            "observations": len(task_data.get("observations", [])),
-            "trajectory_events": len(task_data.get("trajectory", [])),
-            "reward": task_data.get("reward", {}),
-            "output": task_data.get("output"),
+            "result": task_data.get("result"),
             "error": task_data.get("error"),
         }
         print(json.dumps(summary, indent=2))

@@ -1,6 +1,6 @@
 # Examples
 
-These scripts demonstrate the new Web Eye + Memory + Reward flow.
+These scripts demonstrate the v4-style Run API: create a run, poll its status, read the result.
 
 ## Prerequisites
 
@@ -34,10 +34,11 @@ python examples/01_basic_flow.py --base-url http://localhost:8000
 python examples/01_advanced_flow.py --base-url http://localhost:8000
 ```
 
-By default, scripts do not force any provider and will use the server's `DEFAULT_AI_PROVIDER`.
-Use `--provider ollama` or `--provider deepseek` only when you want to override per run.
+The provider comes from the server's `DEFAULT_AI_PROVIDER` (the v4 Create Run body has no provider field).
 
 ## Sample Results
+
+> These samples were captured before the bridge became v4-only, so they show the old summary shape (`finished`, `observations`, `reward`). The scripts now print `completed` and `result`.
 
 ### `01_basic_flow.py`
 

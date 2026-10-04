@@ -1,47 +1,26 @@
 # Browser Use Local Bridge for n8n
 
-This is a local bridge service that enables n8n to communicate with the Browser Use Python library. It mimics the Browser Use Cloud API endpoints but runs locally, allowing you to execute browser automation tasks without relying on the cloud service.
+This is a local bridge service that enables n8n (or any HTTP client) to drive the Browser Use Python library. It implements the **Browser Use Cloud v4 API** (Runs, Sessions and Browsers) locally, so browser automation tasks run on your own machine instead of the cloud service.
+
+> **v4 only.** The pre-v4 task API and the old `/api/v1` path prefix (`/run-task`, `/task/{id}`, `/stop-task`, `/pause-task`, `/resume-task`, `/list-tasks`, `/task/{id}/reward`, `/task/{id}/media*`, `/test-screenshot`) has been removed. Use the Run, Session and Browser resources below. Every route lives under `/api/v4`, the real cloud's base path, so pointing a client at this bridge is a base-URL swap. The old `/api/v4` prefix is gone. Request and response bodies follow the v4 schemas, with the deviations listed in [Differences from the real v4 API](#differences-from-the-real-browser-use-cloud-v4-api).
 
 ## Features
 
-- Compatible with the Browser Use Cloud API endpoints
-- Supports OpenAI, Anthropic, Google, Ollama, DeepSeek, Azure OpenAI, and Bedrock providers
-- Provides task management (run, pause, resume, stop)
-- Exposes status tracking and result retrieval
-- Captures browser observations (screenshot + DOM snapshot)
-- Stores per-task trajectory memory for debugging and replay
-- Supports hybrid reward signals (automatic heuristic + manual feedback)
+- Browser Use Cloud v4 **Run**, **Session** and **Browser** resources (works with the `n8n-nodes-browser-use-cloud` community node set to API Version v4, or with plain HTTP requests)
+- Supports OpenAI, Anthropic, Google, Ollama, DeepSeek, Azure OpenAI, and Bedrock providers (chosen with `DEFAULT_AI_PROVIDER`)
+- Sessions that keep one browser open across follow-up messages (login state survives between runs)
+- Local helper endpoints that have no v4 equivalent: form-value inspection, page outline, PDF text extraction
+- Loop guard, per-run timeout and step budget (see Configuration Options)
 
 ## Architecture Flow
 
-1. Client starts a task with `POST /api/v1/run-task`.
-2. Agent runs in the background and captures step-start screenshots.
-3. For each captured screenshot, the service also stores browser observations:
-   - Current URL
-   - Page title
-   - DOM snapshot (truncated when needed)
-4. The task timeline is saved as a trajectory event stream.
-5. On completion/failure, the service computes an automatic reward score.
-6. Users can submit manual reward feedback via `POST /api/v1/task/{task_id}/reward`.
-7. `GET /api/v1/task/{task_id}` returns task details plus observations, trajectory, and reward.
+1. Client starts a run with `POST /api/v4/runs` (optionally with a `sessionId` to reuse a session's browser).
+2. The agent runs in the background and captures step screenshots (watchable at `/live/{run_id}`).
+3. The client polls `GET /api/v4/runs/{run_id}/status` (or `GET /api/v4/runs/{run_id}` for the result) until the status is `completed`, `failed` or `cancelled`.
+4. With a `sessionId`, the browser stays open afterwards; later `POST /api/v4/runs` calls with the same `sessionId` continue in the same page. `POST /api/v4/sessions/{session_id}/purge` closes it.
+5. Files downloaded during a run are listed by `GET /api/v4/runs/{run_id}/attachments`.
 
-## Core Concepts
-
-### Web Eye (Observation)
-
-The Web Eye is implemented as structured browser observations that are captured during execution. Each observation includes screenshot linkage and page context, which makes the agent behavior easier to inspect.
-
-### Per-Task Memory
-
-Memory is currently stored as per-task trajectory events (`trajectory`) plus observations (`observations`). This is intentionally simple for the demo-first milestone and avoids introducing database complexity too early.
-
-### Reward Loop
-
-The service now supports a hybrid reward model:
-
-- `auto_score`: heuristic score based on terminal task outcome.
-- `manual_score`: user-provided score for human-in-the-loop correction.
-- `effective_score`: resolved score used for downstream evaluation (manual overrides automatic).
+Task data (status, output, screenshots, an internal trajectory of observations and an automatic quality score) is stored under `task_storage/`. It is not exposed through the API.
 
 ## Prerequisites
 
@@ -153,99 +132,98 @@ To keep the server running in the background and auto-restart on crash/login, us
 
 ## API Endpoints
 
-| Method | Endpoint                           | Description                |
-| ------ | ---------------------------------- | -------------------------- |
-| POST   | /api/v1/run-task                   | Start a new browser task   |
-| GET    | /api/v1/task/{task_id}             | Get task details           |
-| GET    | /api/v1/task/{task_id}/status      | Get task status            |
-| PUT    | /api/v1/stop-task/{task_id}        | Stop a running task        |
-| PUT    | /api/v1/pause-task/{task_id}       | Pause a running task       |
-| PUT    | /api/v1/resume-task/{task_id}      | Resume a paused task       |
-| POST   | /api/v1/task/{task_id}/reward      | Submit manual reward score |
-| GET    | /api/v1/list-tasks                 | List all tasks             |
-| GET    | /live/{task_id}                    | Live view UI               |
-| GET    | /api/v1/ping                       | Check health               |
-| GET    | /api/v1/task/{task_id}/media       | Get task media             |
-| GET    | /api/v1/task/{task_id}/media/list  | List all media from task   |
-| GET    | /api/v1/media/{task_id}/{filename} | Display task media content |
+All paths are under `/api/v4`. Bodies follow the [Browser Use Cloud v4 API](https://docs.browser-use.com/cloud/api-v4).
+
+### Run resource
+
+| Method | Endpoint                          | Notes |
+| ------ | ---------------------------------- | ----- |
+| POST   | /api/v4/runs                       | Create a run. Body: `task` (required), `sessionId` (optional). Returns `{id, status, model, sessionId, workspaceId, eventsUrl}` |
+| GET    | /api/v4/runs/{run_id}               | Get a run: `{id, task, status, model, result, output, error, sessionId, workspaceId, createdAt, finishedAt}` |
+| GET    | /api/v4/runs/{run_id}/status        | `{id, status}` (cheap polling) |
+| POST   | /api/v4/runs/{run_id}/cancel        | Cancel a run |
+| GET    | /api/v4/runs                       | List runs (`cursor`, `limit`) |
+| GET    | /api/v4/runs/{run_id}/events        | Always empty: no step event stream is recorded locally |
+| GET    | /api/v4/runs/{run_id}/attachments   | Files produced by the run |
+| GET    | /api/v4/media/{run_id}/{filename}   | Serves an attachment's bytes (the `url` in the attachments list) |
+| GET    | /live/{run_id}                      | Live screenshot view |
+
+Run `status` is one of `queued` (create response only), `running`, `completed`, `failed`, `cancelled`. Run-create fields that only make sense on the real cloud (`model`, `modelParams`, `workspaceId`, `maxCostUsd`, `attachedFileIds`, `judge`, `browserSettings`, ...) are accepted and ignored; the LLM comes from `DEFAULT_AI_PROVIDER`.
+
+### Session resource
+
+Sessions keep one browser open across messages. The first run with a `sessionId` starts the browser; the browser is kept alive afterward and later runs with the same `sessionId` are driven into the same live agent (`Agent.add_new_task`), so follow-ups continue from the same page state.
+
+| Method | Endpoint                                        | Notes |
+| ------ | ------------------------------------------------ | ----- |
+| POST   | /api/v4/runs (with `sessionId`)                   | Create or continue a session |
+| GET    | /api/v4/sessions/{session_id}                     | `{sessionId, workspaceId, latestRunId, task, title, status, createdAt, updatedAt}` |
+| GET    | /api/v4/sessions                                  | List sessions |
+| POST   | /api/v4/sessions/{session_id}/queue               | Queue a message |
+| GET    | /api/v4/sessions/{session_id}/queue               | List the queue |
+| DELETE | /api/v4/sessions/{session_id}/queue/{message_id}  | Cancel a queued message |
+| POST   | /api/v4/sessions/{session_id}/purge               | Stop the agent, close the browser, delete the session |
+
+A session runs one message at a time; starting a run on a session that already has one in flight returns `409 Conflict`.
+
+### Browser resource
+
+A standalone browser with no agent attached, watchable at `/live/browser/{browser_id}`.
+
+| Method | Endpoint                                     | Notes |
+| ------ | ----------------------------------------------| ----- |
+| POST   | /api/v4/browsers                              | Create |
+| GET    | /api/v4/browsers/{browser_id}                 | Get |
+| GET    | /api/v4/browsers                              | List |
+| PATCH  | /api/v4/browsers/{browser_id}                 | Stop |
+| GET    | /api/v4/browsers/{browser_id}/downloads       | List downloads (`path`, `size`, `lastModified`, `hasMore`, `nextCursor`, and `url` with `?includeUrls=true`) |
+| GET    | /api/v4/browsers/{browser_id}/downloads/{filename} | Download a file's bytes |
+
+Each browser has its own downloads directory (`media/browser-{browser_id}/downloads/`). Runs cannot attach to a standalone browser (v4 Create Run has no `browserId` field); use sessions for that.
+
+### Helper endpoints (not part of v4)
+
+| Method | Endpoint                                     | Notes |
+| ------ | ----------------------------------------------| ----- |
+| GET    | /api/v4/sessions/{session_id}/form-values     | Actual values of every visible form control on the session's current page (to verify what an agent says it filled in) |
+| GET    | /api/v4/sessions/{session_id}/page-outline    | Structure of the current page |
+| POST   | /api/v4/pdf/layout-text                       | Extract text from a PDF with `pdftotext -layout` |
+| GET    | /api/v4/browser-config                        | Current browser configuration |
+| GET    | /api/v4/ping                                  | Health check |
+| GET    | /api/v4/tasks                                 | Stub that always returns `{"tasks": []}` for the n8n credential's connection test |
 
 ## Browser Use Cloud v4 Compatibility (n8n Community Node)
 
-This bridge also implements the **Run**, **Session**, and **Browser** resources of the [Browser Use Cloud v4 API](https://docs.browser-use.com/cloud), so the [`n8n-nodes-browser-use-cloud`](https://www.npmjs.com/package/n8n-nodes-browser-use-cloud) community node can point at your local server instead of the real cloud service.
+The [`n8n-nodes-browser-use-cloud`](https://www.npmjs.com/package/n8n-nodes-browser-use-cloud) community node can point at this server instead of the real cloud.
 
 ### Setting up the credential
 
 In n8n, create a **Browser Use API** credential:
 
-- **API Key**: any non-empty value (e.g. `not-needed`) — this local server doesn't check it.
-- **Base URL**: `http://host.docker.internal:<PORT>/api/v1` (use `host.docker.internal` if n8n runs in Docker and the bridge runs on the host; use `http://localhost:<PORT>/api/v1` if both run on the same host network).
+- **API Key**: any non-empty value (e.g. `not-needed`); this local server doesn't check it.
+- **Base URL**: `http://host.docker.internal:<PORT>/api/v4` (use `host.docker.internal` if n8n runs in Docker and the bridge runs on the host; use `http://localhost:<PORT>/api/v4` if both run on the same host network).
 
 The credential's connection test hits `GET {baseUrl}/tasks`, which this bridge stubs out to always return `200`.
 
-In the node itself, select **API Version: v4** for every operation — the base URL you set (ending in `/api/v1`, not `/v2`/`/v3`/`/v4`) is left untouched by the node's version-rewriting logic, so all v4-shaped requests land on this same `/api/v1` prefix.
+In the node itself, select **API Version: v4** for every operation. The base URL you set (ending in `/api/v4`) is left untouched by the node's version-rewriting logic.
 
-### Run resource
+### Differences from the real Browser Use Cloud v4 API
 
-Maps directly onto the existing task model (`run-task` / `task/{id}/status` / `stop-task` / `list-tasks`).
-
-| Method | Endpoint                          | Node operation |
-| ------ | ---------------------------------- | -------------- |
-| POST   | /api/v1/runs                       | Create, Run and Wait |
-| GET    | /api/v1/runs/{run_id}               | Get |
-| GET    | /api/v1/runs/{run_id}/status        | (used internally by Run and Wait's polling) |
-| POST   | /api/v1/runs/{run_id}/cancel        | Cancel |
-| GET    | /api/v1/runs                       | Get Many |
-| GET    | /api/v1/runs/{run_id}/events        | Get Events (always returns empty — no step event stream is recorded locally) |
-| GET    | /api/v1/runs/{run_id}/attachments   | Get Attachments (mapped to the run's task media) |
-
-Fields on the run-create body that only make sense against the real cloud service are accepted but ignored: `model`, `modelParams`, `workspaceId`, `maxCostUsd`, `attachedFileIds`, `judge`, `browserSettings`. Only `task` (and `sessionId`, see below) are used.
-
-### Session resource
-
-The cloud API keeps one browser open across queued follow-up messages. This bridge does the same for real: the browser used for the first run in a session is kept alive afterward instead of being closed, and later messages are driven into the same live agent (`Agent.add_new_task`), so follow-ups continue from the same page state rather than starting a fresh browser.
-
-| Method | Endpoint                                        | Node operation |
-| ------ | ------------------------------------------------ | -------------- |
-| POST   | /api/v1/runs (with `sessionId` in the body)       | Create/continue a session via Run &rarr; Create |
-| GET    | /api/v1/sessions/{session_id}                     | Get |
-| GET    | /api/v1/sessions                                  | Get Many |
-| POST   | /api/v1/sessions/{session_id}/queue               | Queue Message |
-| GET    | /api/v1/sessions/{session_id}/queue               | Get Queue |
-| DELETE | /api/v1/sessions/{session_id}/queue/{message_id}  | Cancel Queued Message |
-| POST   | /api/v1/sessions/{session_id}/purge               | Purge (stops the agent, closes the browser, deletes the session) |
-
-A session only runs one message at a time — starting a new run against a session that already has one in flight returns `409 Conflict`, matching the cloud API's behavior.
-
-### Browser resource
-
-A standalone browser with no agent or task attached — useful for holding a browser open independent of any automation run.
-
-| Method | Endpoint                                     | Node operation |
-| ------ | ----------------------------------------------| -------------- |
-| POST   | /api/v1/browsers                              | Create |
-| GET    | /api/v1/browsers/{browser_id}                 | Get |
-| GET    | /api/v1/browsers                              | Get Many |
-| PATCH  | /api/v1/browsers/{browser_id}                 | Stop |
-| GET    | /api/v1/browsers/{browser_id}/downloads       | Get Downloads |
-| GET    | /api/v1/browsers/{browser_id}/downloads/{filename} | Fetch a downloaded file's bytes |
-| GET    | /live/browser/{browser_id}                    | Minimal auto-refreshing live screenshot view |
-
-Backed by a real `browser_use` browser session with a periodic screenshot loop (every 3s) so it's watchable, but nothing drives it — no agent is attached until something else (e.g. a future feature) takes it over.
-
-Each standalone browser gets a real, dedicated downloads directory (`media/browser-{browser_id}/downloads/`) configured via `browser_use`'s `downloads_path`, so anything the browser downloads while it's open actually lands somewhere retrievable. `GET .../downloads` matches the real [Browser Use Cloud v4 "List Browser Session Downloads"](https://docs.browser-use.com/cloud/api-v4/browsers/list-browser-session-downloads) contract exactly — `path`, `size`, `lastModified`, `hasMore`, `nextCursor`, and (with `?includeUrls=true`) a `url` per file. The one deviation: since this bridge has no object storage, `url` points at this bridge's own `GET .../downloads/{filename}` route (real file bytes, served directly) instead of a presigned, expiring S3 URL — it doesn't expire, but works the same way from a client's perspective.
+- **Auth:** no API key is checked (the real cloud wants `X-Browser-Use-API-Key`; any value is accepted here).
+- **IDs:** `sessionId` can be any string you choose (e.g. `t2-fy2026`); the real cloud requires a UUID.
+- **Create Run response:** `workspaceId` is always `null`; the run starts immediately (there is no queue), `status` is `queued` in the response and `running` once polled.
+- **Session `status`:** `running`, `completed` (idle, waiting for the next message) or `failed`; `title` and `workspaceId` are `null`.
+- **Purge:** returns `200 {success, sessionId}` and works for every session (v4 returns `204` and only for zero-data-retention projects). Delete/update/share/feedback session endpoints and the Workspace resource are not implemented.
+- **Browser sessions:** `cdpUrl`, `timeoutAt` and `recordingUrl` are `null`; cost fields are `"0"`. Downloads `url` points at this bridge instead of a presigned S3 URL.
+- **Events:** `GET /runs/{id}/events` is always empty.
+- **Ignored request fields:** see the Run resource above.
+- **Extras:** the helper endpoints above are specific to this bridge.
 
 ## Usage Examples
 
 ### Provider Selection (Important)
 
-You do not pass any provider parameter to `python app.py`.
-
-Provider selection happens in one of two ways:
-
-1. Global default provider from `.env` via `DEFAULT_AI_PROVIDER`
-2. Per-task override in the `POST /api/v1/run-task` body using `ai_provider`
-
-If `ai_provider` is omitted in a request, the server uses `DEFAULT_AI_PROVIDER`.
+You do not pass any provider parameter to `python app.py`, and the v4 Create Run body has no provider field. The provider comes from `DEFAULT_AI_PROVIDER` in `.env`.
 
 Set Ollama as default in `.env`:
 
@@ -264,67 +242,48 @@ DEEPSEEK_MODEL_ID=deepseek-chat
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 ```
 
-Then start server normally:
+Then start the server normally:
 
 ```bash
 python app.py
 ```
 
-### Starting a Task
+### Starting a Run
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/run-task \
+curl -X POST http://localhost:8000/api/v4/runs \
   -H "Content-Type: application/json" \
-  -d '{"task": "Go to google.com and search for n8n automation", "ai_provider": "openai"}'
+  -d '{"task": "Go to google.com and search for n8n automation"}'
 ```
 
-Use Ollama for a specific task (overrides default):
+### Checking Run Status and Result
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/run-task \
-   -H "Content-Type: application/json" \
-   -d '{"task": "Open example.com and summarize the page", "ai_provider": "ollama"}'
+curl http://localhost:8000/api/v4/runs/{run_id}/status
+curl http://localhost:8000/api/v4/runs/{run_id}
 ```
 
-Use DeepSeek for a specific task (overrides default):
+### Cancelling a Run
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/run-task \
-   -H "Content-Type: application/json" \
-   -d '{"task": "Open example.com and summarize the page", "ai_provider": "deepseek"}'
+curl -X POST http://localhost:8000/api/v4/runs/{run_id}/cancel
 ```
 
-### Checking Task Status
+### Using a Session (keep the browser open between runs)
 
 ```bash
-curl -X GET http://localhost:8000/api/v1/task/{task_id}/status
+# first run starts the browser (logs in, etc.)
+curl -X POST http://localhost:8000/api/v4/runs -H "Content-Type: application/json" \
+  -d '{"task": "Log in to example.com", "sessionId": "my-session"}'
+
+# once it is completed, a follow-up continues in the same page
+curl -X POST http://localhost:8000/api/v4/runs -H "Content-Type: application/json" \
+  -d '{"task": "Now open the settings page", "sessionId": "my-session"}'
+
+# verify what is actually in the form fields, then close the session
+curl http://localhost:8000/api/v4/sessions/my-session/form-values
+curl -X POST http://localhost:8000/api/v4/sessions/my-session/purge
 ```
-
-### Stopping a Task
-
-```bash
-curl -X PUT http://localhost:8000/api/v1/stop-task/{task_id}
-```
-
-### Submitting Manual Reward Feedback
-
-```bash
-curl -X POST http://localhost:8000/api/v1/task/{task_id}/reward \
-   -H "Content-Type: application/json" \
-   -d '{"manual_score": 0.9, "reason": "Task completed accurately"}'
-```
-
-### Inspecting Observation and Reward Data
-
-```bash
-curl -X GET http://localhost:8000/api/v1/task/{task_id}
-```
-
-Look for these fields in the task payload:
-
-- `observations`
-- `trajectory`
-- `reward`
 
 ## Configuration Options
 
@@ -440,13 +399,6 @@ Run any example:
 python examples/01_basic_flow.py --base-url http://localhost:8000
 ```
 
-Run example with explicit provider override:
-
-```bash
-python examples/01_basic_flow.py --base-url http://localhost:8000 --provider ollama
-python examples/01_basic_flow.py --base-url http://localhost:8000 --provider deepseek
-```
-
 I'm using Ollama with:
 `OLLAMA_MODEL_ID=gemma4:e4b-it-q4_K_M` #lfm2.5:8b or gemma4:e4b-it-q4_K_M
 to test the examples
@@ -472,18 +424,8 @@ Example output:
 ````bash
 {
   "id": "4be9cb39-e067-4d5f-b290-80ffb8358488",
-  "status": "finished",
-  "observations": 0,
-  "trajectory_events": 2,
-  "reward": {
-    "auto_score": 0.8,
-    "manual_score": null,
-    "effective_score": 0.8,
-    "source": "auto",
-    "reason": "task finished with non-empty output",
-    "updated_at": "2026-06-22T07:47:05.100077+00:00Z"
-  },
-  "output": "<url>\nhttps://www.youtube.com/watch?v=htk6MRjmcnQ\n</url>\n<query>\nPlease find the view count, the number of likes, and the upload/release date for the video shown on this page. Structure the output as a JSON object with keys 'view_count', 'like_count', and 'upload_date'.\n</query>\n<result>\n```json\n{\n  \"view_count\": \"164,669,057\",\n  \"like_count\": \"826K\",\n  \"upload_date\": \"Jul 1, 2025\"\n}\n```\n</result>",
+  "status": "completed",
+  "result": "<url>\nhttps://www.youtube.com/watch?v=htk6MRjmcnQ\n</url>\n<result>\n```json\n{\n  \"view_count\": \"164,669,057\",\n  \"like_count\": \"826K\",\n  \"upload_date\": \"Jul 1, 2025\"\n}\n```\n</result>",
   "error": null
 }
 ````
@@ -495,11 +437,11 @@ Sample run images:
 ![Step - 3](examples/sample-01/status-step-3-20260622-132702.png)
 ![Step - 4](examples/sample-01/status-step-4-20260622-132908.png)
 
-## Limitations (Current Milestone)
+## Limitations
 
-- Storage is in-memory only; task data is lost on process restart.
-- Reward signals are evaluation metadata, not online RL training.
-- Cross-task episodic memory retrieval is not implemented yet.
+- Storage is in-memory plus `task_storage/` files; runs and sessions are lost on process restart.
+- No auth: anyone who can reach the port can run tasks, so keep it on localhost or a trusted network.
+- Only the v4 Run, Session and Browser resources are implemented (see the differences list above).
 
 ## License
 

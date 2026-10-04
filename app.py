@@ -2367,11 +2367,14 @@ BROWSER_SCREENSHOT_INTERVAL_SECONDS = 3
 def _browser_to_cloud(entry: dict) -> dict:
     """Browser Use Cloud v4 BrowserSessionView (cost/proxy fields are always zero: nothing is metered locally)."""
     stopped = entry["status"] == "stopped"
+    # Local Chrome's DevTools endpoint (127.0.0.1 only), so a client on this host can attach
+    # with Playwright/Puppeteer: playwright.chromium.connect_over_cdp(cdpUrl).
+    cdp_url = None if stopped else getattr(entry.get("browser"), "cdp_url", None)
     return {
         "id": entry["id"],
         "status": "stopped" if stopped else "active",
         "liveUrl": f"/live/browser/{entry['id']}",
-        "cdpUrl": None,
+        "cdpUrl": cdp_url,
         "timeoutAt": None,
         "startedAt": entry["created_at"],
         "finishedAt": entry.get("finished_at"),

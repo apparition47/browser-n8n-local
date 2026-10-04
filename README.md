@@ -176,6 +176,13 @@ A standalone browser with no agent attached, watchable at `/live/browser/{browse
 | PATCH  | /api/v4/browsers/{browser_id}                 | Stop |
 | GET    | /api/v4/browsers/{browser_id}/downloads       | List downloads (`path`, `size`, `lastModified`, `hasMore`, `nextCursor`, and `url` with `?includeUrls=true`) |
 
+A running browser's `cdpUrl` lets a script on the same host attach with Playwright or Puppeteer and drive the browser directly, without the AI agent:
+
+```js
+const browser = await chromium.connectOverCDP(cdpUrl);
+const page = browser.contexts()[0].pages()[0];
+```
+
 Each browser has its own downloads directory (`media/browser-{browser_id}/downloads/`). Runs cannot attach to a standalone browser (v4 Create Run has no `browserId` field); use sessions for that.
 
 ### Bridge extensions (`/bridge/*`, not part of v4)
@@ -217,7 +224,7 @@ In the node itself, select **API Version: v4** for every operation. The base URL
 - **Create Run response:** `workspaceId` is always `null`; the run starts immediately (there is no queue), `status` is `queued` in the response and `running` once polled.
 - **Session `status`:** `running`, `completed` (idle, waiting for the next message) or `failed`; `title` and `workspaceId` are `null`.
 - **Purge:** returns `200 {success, sessionId}` and works for every session (v4 returns `204` and only for zero-data-retention projects). Delete/update/share/feedback session endpoints and the Workspace resource are not implemented.
-- **Browser sessions:** `cdpUrl`, `timeoutAt` and `recordingUrl` are `null`; cost fields are `"0"`. Downloads `url` points at this bridge instead of a presigned S3 URL.
+- **Browser sessions:** `timeoutAt` and `recordingUrl` are `null`; cost fields are `"0"`. `cdpUrl` is a local `ws://127.0.0.1:<port>/devtools/browser/<id>` address, only reachable from the machine running the bridge. Downloads `url` points at this bridge instead of a presigned S3 URL.
 - **Events:** `GET /runs/{id}/events` is always empty.
 - **Ignored request fields:** see the Run resource above.
 - **Extras:** everything under `/bridge/` is specific to this bridge.

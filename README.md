@@ -9,7 +9,7 @@ This is a local bridge service that enables n8n (or any HTTP client) to drive th
 - Browser Use Cloud v4 **Run**, **Session** and **Browser** resources (works with the `n8n-nodes-browser-use-cloud` community node set to API Version v4, or with plain HTTP requests)
 - Supports OpenAI, Anthropic, Google, Ollama, DeepSeek, Azure OpenAI, and Bedrock providers (chosen with `DEFAULT_AI_PROVIDER`)
 - Sessions that keep one browser open across follow-up messages (login state survives between runs)
-- Local helper endpoints that have no v4 equivalent: form-value inspection, page outline, PDF text extraction
+- Bridge-only extensions under `/bridge/` (kept out of the v4 namespace): form-value inspection, page outline, PDF text extraction
 - Loop guard, per-run timeout and step budget (see Configuration Options)
 
 ## Architecture Flow
@@ -145,8 +145,6 @@ All paths are under `/api/v4`. Bodies follow the [Browser Use Cloud v4 API](http
 | GET    | /api/v4/runs                       | List runs (`cursor`, `limit`) |
 | GET    | /api/v4/runs/{run_id}/events        | Always empty: no step event stream is recorded locally |
 | GET    | /api/v4/runs/{run_id}/attachments   | Files produced by the run |
-| GET    | /api/v4/media/{run_id}/{filename}   | Serves an attachment's bytes (the `url` in the attachments list) |
-| GET    | /live/{run_id}                      | Live screenshot view |
 
 Run `status` is one of `queued` (create response only), `running`, `completed`, `failed`, `cancelled`. Run-create fields that only make sense on the real cloud (`model`, `modelParams`, `workspaceId`, `maxCostUsd`, `attachedFileIds`, `judge`, `browserSettings`, ...) are accepted and ignored; the LLM comes from `DEFAULT_AI_PROVIDER`.
 
@@ -177,20 +175,23 @@ A standalone browser with no agent attached, watchable at `/live/browser/{browse
 | GET    | /api/v4/browsers                              | List |
 | PATCH  | /api/v4/browsers/{browser_id}                 | Stop |
 | GET    | /api/v4/browsers/{browser_id}/downloads       | List downloads (`path`, `size`, `lastModified`, `hasMore`, `nextCursor`, and `url` with `?includeUrls=true`) |
-| GET    | /api/v4/browsers/{browser_id}/downloads/{filename} | Download a file's bytes |
 
 Each browser has its own downloads directory (`media/browser-{browser_id}/downloads/`). Runs cannot attach to a standalone browser (v4 Create Run has no `browserId` field); use sessions for that.
 
-### Helper endpoints (not part of v4)
+### Bridge extensions (`/bridge/*`, not part of v4)
+
+Everything outside the v4 spec lives under `/bridge/` so it can never be mistaken for, or collide with, a v4 route. (One exception: `GET /api/v4/tasks` is a stub that always returns `{"tasks": []}`, because the n8n community node's connection test requests `{baseUrl}/tasks`.)
 
 | Method | Endpoint                                     | Notes |
 | ------ | ----------------------------------------------| ----- |
-| GET    | /api/v4/sessions/{session_id}/form-values     | Actual values of every visible form control on the session's current page (to verify what an agent says it filled in) |
-| GET    | /api/v4/sessions/{session_id}/page-outline    | Structure of the current page |
-| POST   | /api/v4/pdf/layout-text                       | Extract text from a PDF with `pdftotext -layout` |
-| GET    | /api/v4/browser-config                        | Current browser configuration |
-| GET    | /api/v4/ping                                  | Health check |
-| GET    | /api/v4/tasks                                 | Stub that always returns `{"tasks": []}` for the n8n credential's connection test |
+| GET    | /bridge/sessions/{session_id}/form-values     | Actual values of every visible form control on the session's current page (to verify what an agent says it filled in) |
+| GET    | /bridge/sessions/{session_id}/page-outline    | Structure of the current page |
+| POST   | /bridge/pdf/layout-text                       | Extract text from a PDF with `pdftotext -layout` |
+| GET    | /bridge/media/{run_id}/{filename}             | Bytes of a run attachment (the `url` in `GET /api/v4/runs/{id}/attachments`; the real cloud returns presigned S3 URLs instead) |
+| GET    | /bridge/browsers/{browser_id}/downloads/{filename} | Bytes of a browser download (the `url` in the downloads list) |
+| GET    | /bridge/browser-config                        | Current browser configuration |
+| GET    | /bridge/ping                                  | Health check |
+| GET    | /live/{run_id}, /live/browser/{browser_id}    | Live screenshot views |
 
 ## Browser Use Cloud v4 Compatibility (n8n Community Node)
 
@@ -217,7 +218,7 @@ In the node itself, select **API Version: v4** for every operation. The base URL
 - **Browser sessions:** `cdpUrl`, `timeoutAt` and `recordingUrl` are `null`; cost fields are `"0"`. Downloads `url` points at this bridge instead of a presigned S3 URL.
 - **Events:** `GET /runs/{id}/events` is always empty.
 - **Ignored request fields:** see the Run resource above.
-- **Extras:** the helper endpoints above are specific to this bridge.
+- **Extras:** everything under `/bridge/` is specific to this bridge.
 
 ## Usage Examples
 
@@ -281,7 +282,7 @@ curl -X POST http://localhost:8000/api/v4/runs -H "Content-Type: application/jso
   -d '{"task": "Now open the settings page", "sessionId": "my-session"}'
 
 # verify what is actually in the form fields, then close the session
-curl http://localhost:8000/api/v4/sessions/my-session/form-values
+curl http://localhost:8000/bridge/sessions/my-session/form-values
 curl -X POST http://localhost:8000/api/v4/sessions/my-session/purge
 ```
 

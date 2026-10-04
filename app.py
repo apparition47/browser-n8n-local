@@ -1997,7 +1997,7 @@ async def get_cloud_run_events(run_id: str, user_id: str = Depends(get_user_id))
 async def get_cloud_run_attachments(run_id: str, user_id: str = Depends(get_user_id)):
     media = await list_task_media(run_id, user_id)
     attachments = [
-        {"id": item["filename"], "filename": item["filename"], "url": f"/api/v4{item['url']}"}
+        {"id": item["filename"], "filename": item["filename"], "url": f"/bridge{item['url']}"}
         for item in media.get("media", [])
     ]
     return {"attachments": attachments}
@@ -2280,7 +2280,7 @@ _FORM_VALUES_JS = """() => {
 }"""
 
 
-@app.get("/api/v4/sessions/{session_id}/form-values")
+@app.get("/bridge/sessions/{session_id}/form-values")
 async def session_form_values(session_id: str, user_id: str = Depends(get_user_id)):
     """Read the actual values of every visible form control on the session's current page.
 
@@ -2320,7 +2320,7 @@ _PAGE_OUTLINE_JS = """() => {
 }"""
 
 
-@app.get("/api/v4/sessions/{session_id}/page-outline")
+@app.get("/bridge/sessions/{session_id}/page-outline")
 async def session_page_outline(session_id: str, user_id: str = Depends(get_user_id)):
     """Read-only structural dump of the session's current page (visible text, headings, buttons, tables)."""
     session = _sessions.get(session_id)
@@ -2499,7 +2499,7 @@ async def get_cloud_browser_downloads(
                 "path": p.name,
                 "size": stat.st_size,
                 "lastModified": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat().replace("+00:00", "Z"),
-                "url": f"/api/v4/browsers/{browser_id}/downloads/{p.name}" if includeUrls else None,
+                "url": f"/bridge/browsers/{browser_id}/downloads/{p.name}" if includeUrls else None,
             }
         )
 
@@ -2510,7 +2510,7 @@ async def get_cloud_browser_downloads(
     }
 
 
-@app.get("/api/v4/browsers/{browser_id}/downloads/{filename}")
+@app.get("/bridge/browsers/{browser_id}/downloads/{filename}")
 async def get_browser_download_file(
     browser_id: str, filename: str, user_id: str = Depends(get_user_id)
 ):
@@ -2533,7 +2533,7 @@ async def browser_live_view(browser_id: str, user_id: str = Depends(get_user_id)
     if browser_id not in _browsers:
         raise HTTPException(status_code=404, detail="Browser session not found")
 
-    img_url = f"/api/v4/media/browser-{browser_id}/latest.png"
+    img_url = f"/bridge/media/browser-{browser_id}/latest.png"
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -2646,13 +2646,13 @@ async def live_view(task_id: str, user_id: str = Depends(get_user_id)):
     return HTMLResponse(content=html_content)
 
 
-@app.get("/api/v4/ping")
+@app.get("/bridge/ping")
 async def ping():
     """Health check endpoint"""
     return {"status": "success", "message": "API is running"}
 
 
-@app.post("/api/v4/pdf/layout-text")
+@app.post("/bridge/pdf/layout-text")
 async def pdf_layout_text(request: Request):
     """Extract layout-preserving text from a PDF sent as the raw request body.
 
@@ -2683,7 +2683,7 @@ async def pdf_layout_text(request: Request):
     return {"pageCount": len(pages), "pages": pages}
 
 
-@app.get("/api/v4/browser-config")
+@app.get("/bridge/browser-config")
 async def browser_config():
     """Get current browser configuration
 
@@ -2754,7 +2754,7 @@ async def list_task_media(
     return {"media": media_info, "count": len(media_info)}
 
 
-@app.get("/api/v4/media/{task_id}/{filename}")
+@app.get("/bridge/media/{task_id}/{filename}")
 async def get_media_file(
     task_id: str,
     filename: str,

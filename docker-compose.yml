@@ -53,7 +53,7 @@ services:
     restart: unless-stopped
     # Added healthcheck to ensure service is running properly
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v4/ping"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/bridge/ping"]
       interval: 30s
       timeout: 10s
       retries: 3

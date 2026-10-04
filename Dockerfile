@@ -50,7 +50,7 @@ RUN chown -R appuser:appuser /app
 USER appuser
 
 # Set healthcheck to ensure the service is running properly
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 CMD curl -f http://localhost:8000/api/v4/ping || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 CMD curl -f http://localhost:8000/bridge/ping || exit 1
 
 # Command to run the application
 CMD ["python", "app.py"] 

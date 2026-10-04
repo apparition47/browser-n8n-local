@@ -270,6 +270,17 @@ def get_llm(ai_provider: str):
         if custom_headers:
             kwargs["default_headers"] = custom_headers
 
+        # Some models reject non-default sampling params. Set to "none" to omit.
+        for env_name, kwarg in (
+            ("OPENAI_TEMPERATURE", "temperature"),
+            ("OPENAI_FREQUENCY_PENALTY", "frequency_penalty"),
+        ):
+            raw = os.environ.get(env_name, "").strip().lower()
+            if raw == "none":
+                kwargs[kwarg] = None
+            elif raw:
+                kwargs[kwarg] = float(raw)
+
         return ChatOpenAI(**kwargs)
 
 

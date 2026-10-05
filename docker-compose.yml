@@ -42,6 +42,8 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # Set to true to see the browser during execution
       - BROWSER_USE_HEADFUL=${BROWSER_USE_HEADFUL:-false}
+      # The image can't run Jev (Python 3.11, no ../jev-ultrafast checkout)
+      - DEFAULT_NAVIGATOR=${DEFAULT_NAVIGATOR:-browser-use}
       - BROWSER_USE_TELEMETRY=0
       - ANONYMIZED_TELEMETRY=false
       

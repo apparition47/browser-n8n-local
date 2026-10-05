@@ -11,7 +11,7 @@ import signal
 import sys
 import re
 
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime, UTC
 from enum import Enum
 from typing import cast
@@ -62,6 +62,7 @@ from pathlib import Path
 # Import our task storage abstraction
 from task_storage import get_task_storage
 from task_storage.base import DEFAULT_USER_ID
+import jev_navigator
 
 
 # Define task status enum
@@ -116,6 +117,22 @@ LOOP_GUARD_MAX_CONSECUTIVE_DUPLICATE_SCREENSHOTS = int(
 LOOP_GUARD_MAX_SCREENSHOT_ERRORS = int(
     os.environ.get("LOOP_GUARD_MAX_SCREENSHOT_ERRORS", "3")
 )
+NAVIGATORS = ("browser-use", "jev")
+
+
+def _navigator_setting(raw: Optional[str]) -> str:
+    """DEFAULT_NAVIGATOR, browser-use unless set; an unknown value stops startup instead of failing every run."""
+    value = (raw or "").strip().lower() or "browser-use"
+    if value not in NAVIGATORS:
+        raise SystemExit(f"DEFAULT_NAVIGATOR must be one of: {', '.join(NAVIGATORS)} (got {raw!r})")
+    return value
+
+
+DEFAULT_NAVIGATOR = _navigator_setting(os.environ.get("DEFAULT_NAVIGATOR"))
+JEV_SCREENSHOTS = os.environ.get("JEV_SCREENSHOTS", "true").lower() == "true"
+# Like jev-ultrafast, a Jev run returns its final state; an answer written by DEFAULT_AI_PROVIDER is opt-in.
+JEV_EXTRACT = os.environ.get("JEV_EXTRACT", "false").lower() == "true"
+JEV_PAGE_TEXT_MAX_CHARS = int(os.environ.get("JEV_PAGE_TEXT_MAX_CHARS", "20000"))
 
 
 @asynccontextmanager
@@ -195,6 +212,8 @@ class TaskRequest(BaseModel):
     use_custom_chrome: Optional[bool] = (
         None  # Whether to use custom Chrome from env vars
     )
+    navigator: Optional[Literal["browser-use", "jev"]] = None  # None means DEFAULT_NAVIGATOR
+    extract: Optional[bool] = None  # Jev runs only; None means JEV_EXTRACT
 
 
 class TaskResponse(BaseModel):
@@ -523,19 +542,25 @@ def resolve_use_vision(ai_provider: str) -> bool:
     return True
 
 
+JSON_OUTPUT_CONTRACT = (
+    "Output contract:\n"
+    "- Return the final answer as exactly one valid JSON object (no markdown, no code fences, no extra text).\n"
+    "- Use dynamic keys that fit the task; do not rely on a fixed schema.\n"
+    '- Include a short top-level "summary" string and put detailed values in other JSON fields.\n'
+    '- If a requested value is unavailable, include the key with value null and explain briefly in "summary".\n'
+)
+# browser-use only: Jev runs answer with a single extraction call, so there's no done() to call.
+BROWSER_USE_COMPLETION_RULE = (
+    "\nCOMPLETION RULE (Critical):\n"
+    "- Once the extract tool (or any tool) returns the requested data, IMMEDIATELY format as JSON and call done().\n"
+    "- Do NOT attempt further browser navigation or tool calls after successful extraction.\n"
+    "- Do NOT loop or retry; successful extraction = task complete."
+)
+
+
 def build_agent_task(instruction: str) -> str:
     """Optionally wrap task with constraints that reduce tool-chatter loops."""
-    json_output_contract = (
-        "Output contract:\n"
-        "- Return the final answer as exactly one valid JSON object (no markdown, no code fences, no extra text).\n"
-        "- Use dynamic keys that fit the task; do not rely on a fixed schema.\n"
-        '- Include a short top-level "summary" string and put detailed values in other JSON fields.\n'
-        '- If a requested value is unavailable, include the key with value null and explain briefly in "summary".\n'
-        "\nCOMPLETION RULE (Critical):\n"
-        "- Once the extract tool (or any tool) returns the requested data, IMMEDIATELY format as JSON and call done().\n"
-        "- Do NOT attempt further browser navigation or tool calls after successful extraction.\n"
-        "- Do NOT loop or retry; successful extraction = task complete."
-    )
+    json_output_contract = JSON_OUTPUT_CONTRACT + BROWSER_USE_COMPLETION_RULE
 
     if not AGENT_ENFORCE_CONCISE_EXECUTION:
         return f"{instruction}\n\n{json_output_contract}"
@@ -1030,6 +1055,29 @@ def compute_auto_reward(task: Optional[dict]) -> tuple[float, str]:
     return 0.0, "task is non-terminal or lacks clear success signal"
 
 
+def _record_auto_reward(task_id: str, user_id: str):
+    """Score a terminal task with the heuristic reward and log it on the trajectory."""
+    task = task_storage.get_task(task_id, user_id)
+    auto_score, auto_reason = compute_auto_reward(task)
+    task_storage.set_task_reward(
+        task_id,
+        {
+            "auto_score": auto_score,
+            "effective_score": auto_score,
+            "source": "auto",
+            "reason": auto_reason,
+            "updated_at": datetime.now(UTC).isoformat() + "Z",
+        },
+        user_id,
+    )
+    add_trajectory_event(
+        task_id,
+        user_id,
+        "reward_auto",
+        {"score": auto_score, "reason": auto_reason},
+    )
+
+
 async def collect_browser_observation(agent) -> Optional[dict]:
     """Capture a lightweight browser state snapshot, including DOM content."""
     if not hasattr(agent, "browser_session") or agent.browser_session is None:
@@ -1249,6 +1297,7 @@ async def execute_task(
     ai_provider: str,
     user_id: str = DEFAULT_USER_ID,
     session_id: Optional[str] = None,
+    navigator: str = "browser-use",
 ):
     """Execute browser task in background - main orchestration function
 
@@ -1259,6 +1308,10 @@ async def execute_task(
     session registry instead of being torn down, so a later queued
     message on the same session can continue in the same browser tab.
     """
+    if navigator == "jev":
+        await _execute_jev_task(task_id, instruction, ai_provider, user_id, session_id)
+        return
+
     browser = None
     agent = None
 
@@ -1336,25 +1389,7 @@ async def execute_task(
                 user_id,
             )
             task_storage.mark_task_finished(task_id, user_id, TaskStatus.FINISHED)
-            finished_task = task_storage.get_task(task_id, user_id)
-            auto_score, auto_reason = compute_auto_reward(finished_task)
-            task_storage.set_task_reward(
-                task_id,
-                {
-                    "auto_score": auto_score,
-                    "effective_score": auto_score,
-                    "source": "auto",
-                    "reason": auto_reason,
-                    "updated_at": datetime.now(UTC).isoformat() + "Z",
-                },
-                user_id,
-            )
-            add_trajectory_event(
-                task_id,
-                user_id,
-                "reward_auto",
-                {"score": auto_score, "reason": auto_reason},
-            )
+            _record_auto_reward(task_id, user_id)
             await collect_browser_cookies(agent, task_id, user_id)
             return
 
@@ -1425,25 +1460,7 @@ async def execute_task(
         else:
             task_storage.mark_task_finished(task_id, user_id, TaskStatus.FINISHED)
 
-        finished_task = task_storage.get_task(task_id, user_id)
-        auto_score, auto_reason = compute_auto_reward(finished_task)
-        task_storage.set_task_reward(
-            task_id,
-            {
-                "auto_score": auto_score,
-                "effective_score": auto_score,
-                "source": "auto",
-                "reason": auto_reason,
-                "updated_at": datetime.now(UTC).isoformat() + "Z",
-            },
-            user_id,
-        )
-        add_trajectory_event(
-            task_id,
-            user_id,
-            "reward_auto",
-            {"score": auto_score, "reason": auto_reason},
-        )
+        _record_auto_reward(task_id, user_id)
         await collect_browser_cookies(agent, task_id, user_id)
 
     except Exception as e:
@@ -1509,53 +1526,155 @@ async def execute_task(
                 )
                 task_storage.mark_task_finished(task_id, user_id, TaskStatus.STOPPED)
 
-            timed_out_task = task_storage.get_task(task_id, user_id)
-            auto_score, auto_reason = compute_auto_reward(timed_out_task)
-            task_storage.set_task_reward(
-                task_id,
-                {
-                    "auto_score": auto_score,
-                    "effective_score": auto_score,
-                    "source": "auto",
-                    "reason": auto_reason,
-                    "updated_at": datetime.now(UTC).isoformat() + "Z",
-                },
-                user_id,
-            )
-            add_trajectory_event(
-                task_id,
-                user_id,
-                "reward_auto",
-                {"score": auto_score, "reason": auto_reason},
-            )
+            _record_auto_reward(task_id, user_id)
             return
 
         logger.exception(f"Error executing task {task_id}")
         task_storage.update_task_status(task_id, TaskStatus.FAILED, user_id)
         task_storage.set_task_error(task_id, str(e), user_id)
         task_storage.mark_task_finished(task_id, user_id, TaskStatus.FAILED)
-        failed_task = task_storage.get_task(task_id, user_id)
-        auto_score, auto_reason = compute_auto_reward(failed_task)
-        task_storage.set_task_reward(
-            task_id,
-            {
-                "auto_score": auto_score,
-                "effective_score": auto_score,
-                "source": "auto",
-                "reason": auto_reason,
-                "updated_at": datetime.now(UTC).isoformat() + "Z",
-            },
-            user_id,
-        )
-        add_trajectory_event(
-            task_id,
-            user_id,
-            "reward_auto",
-            {"score": auto_score, "reason": auto_reason},
-        )
+        _record_auto_reward(task_id, user_id)
     finally:
         if session_id:
             await _park_session_browser(session_id, agent, browser, user_id)
+        else:
+            await cleanup_task(browser, task_id, user_id)
+
+
+def _fail_task(task_id: str, user_id: str, message: str):
+    """Finish a task as failed with a reason, scored like any other terminal state."""
+    task_storage.update_task_status(task_id, TaskStatus.FAILED, user_id)
+    task_storage.set_task_error(task_id, message, user_id)
+    task_storage.mark_task_finished(task_id, user_id, TaskStatus.FAILED)
+    _record_auto_reward(task_id, user_id)
+
+
+async def _save_jev_screenshot(browser: Browser, task_id: str, user_id: str):
+    """Viewport PNG after a Jev action, taken between ticks so it can't race Jev's input."""
+    try:
+        png = await browser.take_screenshot()
+    except Exception as screenshot_error:
+        logger.warning(f"Task {task_id}: Jev screenshot failed: {screenshot_error}")
+        return
+    validate_and_save_screenshot(png, task_id, user_id, TaskStatus.RUNNING)
+
+
+async def _run_jev(
+    task_id: str,
+    user_id: str,
+    instruction: str,
+    ai_provider: str,
+    browser: Browser,
+    controller: "jev_navigator.JevController",
+    start_url: Optional[str],
+):
+    """Navigate with Jev on a started browser. On DONE the output is Jev's final state, or an
+    LLM-written answer when the run opted in with extract."""
+    if start_url:
+        await browser.navigate_to(start_url)
+
+    steps = []
+
+    async def on_step(entry: dict):
+        step = jev_navigator.step_record(entry, datetime.now(UTC).isoformat() + "Z")
+        steps.append({key: step[key] for key in ("step", "operation", "action", "text", "url")})
+        task_storage.add_task_step(task_id, step, user_id)
+        add_trajectory_event(task_id, user_id, "jev_action", step)
+        # The v4 API doesn't expose steps; this line is how to follow a Jev run live.
+        logger.info(
+            f"Task {task_id}: Jev step {step['step']} {step['operation']} {step['action']!r} -> {step['url']}"
+        )
+        if JEV_SCREENSHOTS:
+            await _save_jev_screenshot(browser, task_id, user_id)
+
+    outcome = await jev_navigator.navigate(
+        browser,
+        instruction,
+        controller,
+        timeout_seconds=TASK_RUN_TIMEOUT_SECONDS if TASK_RUN_TIMEOUT_SECONDS > 0 else None,
+        on_step=on_step,
+    )
+    status, error = jev_navigator.terminal_status(outcome)
+    if outcome.kind == "done":
+        extract = (task_storage.get_task(task_id, user_id) or {}).get("extract", False)
+        try:
+            page = await jev_navigator.read_page(browser, outcome.target_id, JEV_PAGE_TEXT_MAX_CHARS)
+            if extract:
+                output = await jev_navigator.extract_output(
+                    get_llm(ai_provider), instruction, page, JSON_OUTPUT_CONTRACT
+                )
+            else:
+                output = jev_navigator.state_output(page, steps)
+            task_storage.set_task_output(task_id, output, user_id)
+        except Exception as extraction_error:
+            logger.exception(f"Task {task_id}: Jev extraction failed")
+            status, error = TaskStatus.FAILED, f"Extraction failed: {extraction_error}"
+    if error:
+        task_storage.set_task_error(task_id, error, user_id)
+    task_storage.mark_task_finished(task_id, user_id, TaskStatus(status))
+    await collect_browser_cookies(controller, task_id, user_id)
+    _record_auto_reward(task_id, user_id)
+
+
+async def _execute_jev_task(
+    task_id: str,
+    instruction: str,
+    ai_provider: str,
+    user_id: str,
+    session_id: Optional[str] = None,
+):
+    """Jev run: fail fast before any browser launches, then navigate and extract on the bridge's own tab."""
+    browser = None
+    controller = None
+    try:
+        task_storage.update_task_status(task_id, TaskStatus.RUNNING, user_id)
+        prepare_task_environment(task_id, user_id)
+        try:
+            jev_navigator.ensure_available()
+        except jev_navigator.JevUnavailable as unavailable:
+            logger.warning(f"Task {task_id}: Jev unavailable: {unavailable}")
+            _fail_task(task_id, user_id, str(unavailable))
+            return
+        start_url = jev_navigator.find_start_url(instruction)
+        if not start_url:
+            _fail_task(
+                task_id,
+                user_id,
+                "Jev needs a start URL: put a URL or domain (for example google.com) in the task text",
+            )
+            return
+
+        task = task_storage.get_task(task_id, user_id) or {}
+        downloads_dir = MEDIA_DIR / task_id
+        # No keep_alive, even for sessions: it exists because the browser-use Agent resets its browser
+        # when a run ends. Jev has no Agent, so its browser survives between session runs anyway, and
+        # purge's close() still shuts it down.
+        browser, browser_info = configure_browser_profile(
+            task.get("browser_config", {}), downloads_dir=downloads_dir
+        )
+        if browser is None:
+            # configure_browser_profile leaves headful runs without CHROME_PATH to browser-use's Agent; Jev has none.
+            downloads_dir.mkdir(parents=True, exist_ok=True)
+            browser = Browser(
+                browser_profile=BrowserProfile(
+                    headless=False,
+                    viewport={"width": 1280, "height": 720},
+                    window_size={"width": 1280, "height": 720},
+                    downloads_path=str(downloads_dir),
+                )
+            )
+        logger.info(f"Task {task_id}: Jev navigator, start_url={start_url}, browser={browser_info}")
+        # Registered before the browser starts, so a cancel during launch stops the run before its first step.
+        controller = jev_navigator.JevController(browser)
+        task_storage.set_task_agent(task_id, controller, user_id)
+        await browser.start()
+        await _run_jev(task_id, user_id, instruction, ai_provider, browser, controller, start_url)
+    except Exception as error:
+        logger.exception(f"Error executing Jev task {task_id}")
+        _fail_task(task_id, user_id, str(error))
+    finally:
+        if session_id:
+            await _park_session_browser(session_id, controller, browser, user_id)
         else:
             await cleanup_task(browser, task_id, user_id)
 
@@ -1570,6 +1689,8 @@ def _new_task_record(
     headful: Optional[bool] = None,
     use_custom_chrome: Optional[bool] = None,
     session_id: Optional[str] = None,
+    navigator: str = "browser-use",
+    extract: bool = False,
 ) -> str:
     """Build and store a fresh task record. Returns its live_url."""
     now = datetime.now(UTC).isoformat() + "Z"
@@ -1607,6 +1728,8 @@ def _new_task_record(
         "screenshot_error_count": 0,
         "live_url": live_url,
         "session_id": session_id,
+        "navigator": navigator,
+        "extract": extract,
     }
 
     task_storage.create_task(task_id, task_data, user_id)
@@ -1620,6 +1743,8 @@ async def run_task(
 ):
     """Start a browser automation task"""
     task_id = str(uuid.uuid4())
+    navigator = request.navigator or DEFAULT_NAVIGATOR
+    extract = JEV_EXTRACT if request.extract is None else request.extract
     live_url = _new_task_record(
         task_id,
         request.task,
@@ -1629,12 +1754,16 @@ async def run_task(
         headful=request.headful,
         use_custom_chrome=request.use_custom_chrome,
         session_id=session_id,
+        navigator=navigator,
+        extract=extract,
     )
 
     # Start task in background
     ai_provider = request.ai_provider or "openai"
     asyncio.create_task(
-        execute_task(task_id, request.task, ai_provider, user_id, session_id=session_id)
+        execute_task(
+            task_id, request.task, ai_provider, user_id, session_id=session_id, navigator=navigator
+        )
     )
 
     return TaskResponse(id=task_id, status=TaskStatus.CREATED, live_url=live_url)
@@ -1877,8 +2006,10 @@ async def stop_task(task_id: str, user_id: str = Depends(get_user_id)):
 # Session: the cloud keeps one browser open across queued follow-up
 # messages. Here that's real too - the agent/browser created for a run
 # started with a sessionId are kept alive (see _park_session_browser)
-# instead of being closed, and later messages are driven into the same
-# agent via Agent.add_new_task() rather than starting a fresh browser.
+# instead of being closed. Later messages continue on the same tab: a
+# browser-use follow-up drives the session's agent via Agent.add_new_task(),
+# a Jev follow-up runs a fresh Jev goal. Each follow-up may pick its own
+# navigator (e.g. log in with browser-use, then navigate with Jev).
 #
 # Browser: a standalone browser with no agent/task attached. Backed by a
 # real browser_use Browser session with a periodic screenshot loop for a
@@ -1937,11 +2068,24 @@ async def create_cloud_run(request: Request, user_id: str = Depends(get_user_id)
     if not task_text:
         raise HTTPException(status_code=400, detail='The "task" field is required.')
 
+    # Bridge extensions, not in the cloud API: pick Jev or browser-use, and opt a Jev run into an LLM-written answer.
+    navigator = body.get("navigator")
+    if navigator is not None and navigator not in NAVIGATORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f'The "navigator" field must be one of: {", ".join(NAVIGATORS)}.',
+        )
+    extract = body.get("extract")
+    if extract is not None and not isinstance(extract, bool):
+        raise HTTPException(status_code=400, detail='The "extract" field must be true or false.')
+
     session_id = body.get("sessionId")
     if session_id:
-        return await _create_or_continue_session_run(session_id, task_text, user_id)
+        return await _create_or_continue_session_run(
+            session_id, task_text, user_id, navigator=navigator, extract=extract
+        )
 
-    response = await run_task(TaskRequest(task=task_text), user_id)
+    response = await run_task(TaskRequest(task=task_text, navigator=navigator, extract=extract), user_id)
     return _run_create_response(response.id, task_text)
 
 
@@ -2004,9 +2148,11 @@ async def get_cloud_run_attachments(run_id: str, user_id: str = Depends(get_user
 
 
 # --- Session resource: real cross-run continuity on one browser ---
-# session_id -> {id, user_id, ai_provider, status, current_run_id, agent,
-#                browser, queue: [{id, text, run_id}], next_message_id,
-#                created_at}
+# session_id -> {id, user_id, ai_provider, navigator (the default for follow-ups),
+#                status, current_run_id, latest_run_id, first_run_id,
+#                agent (whatever drove the last run: an Agent or a JevController),
+#                browser_use_agent (kept for browser-use follow-ups), browser,
+#                queue: [{id, text, run_id}], next_message_id, created_at}
 _sessions: dict = {}
 
 
@@ -2044,6 +2190,8 @@ async def _park_session_browser(
         return
 
     session["agent"] = agent
+    if agent is not None and not isinstance(agent, jev_navigator.JevController):
+        session["browser_use_agent"] = agent  # kept across Jev follow-ups for later browser-use ones
     session["browser"] = browser
     session["status"] = "idle"
     session["current_run_id"] = None
@@ -2055,13 +2203,29 @@ async def _run_session_continuation(
 ):
     """Drive a follow-up message into a session's already-open agent/browser."""
     session = _sessions.get(session_id)
-    agent = session.get("agent") if session else None
+    task = task_storage.get_task(task_id, user_id) or {}
+    if session and (task.get("navigator") or session.get("navigator")) == "jev":
+        try:
+            await _continue_jev_session(session, task_id, message_text, user_id)
+        finally:
+            session["status"] = "idle"
+            session["current_run_id"] = None
+            asyncio.create_task(_drain_session_queue(session_id, user_id))
+        return
+
+    agent = session.get("browser_use_agent") if session else None
 
     task_storage.update_task_status(task_id, TaskStatus.RUNNING, user_id)
     if agent is not None:
+        session["agent"] = agent  # this run's driver, for purge and the /bridge/sessions endpoints
         task_storage.set_task_agent(task_id, agent, user_id)
 
     try:
+        if agent is None and session and session.get("navigator") == "jev":
+            raise RuntimeError(
+                "This session started with Jev, so it has no browser-use agent; start the session with "
+                '"navigator": "browser-use" to use browser-use follow-ups'
+            )
         if agent is None:
             raise RuntimeError(
                 "Session has no active browser/agent to continue (it may have failed or been purged)"
@@ -2109,6 +2273,40 @@ async def _run_session_continuation(
             asyncio.create_task(_drain_session_queue(session_id, user_id))
 
 
+async def _continue_jev_session(session: dict, task_id: str, message_text: str, user_id: str):
+    """A Jev follow-up in a session: same tab, a fresh Jev goal, starting where the last run ended
+    unless the message contains a full http(s) URL."""
+    try:
+        task_storage.update_task_status(task_id, TaskStatus.RUNNING, user_id)
+        prepare_task_environment(task_id, user_id)
+        # A headful browser-use first run without CHROME_PATH lets its Agent build the browser, so none is parked.
+        browser = session.get("browser") or getattr(session.get("browser_use_agent"), "browser_session", None)
+        if browser is None:
+            _fail_task(
+                task_id,
+                user_id,
+                "Session has no active browser to continue (it may have failed or been purged)",
+            )
+            return
+        jev_navigator.ensure_available()
+        controller = jev_navigator.JevController(browser)
+        session["agent"] = controller
+        task_storage.set_task_agent(task_id, controller, user_id)
+        ai_provider = session.get("ai_provider") or os.environ.get("DEFAULT_AI_PROVIDER", "openai")
+        await _run_jev(
+            task_id,
+            user_id,
+            message_text,
+            ai_provider,
+            browser,
+            controller,
+            jev_navigator.find_start_url(message_text, bare_domains=False),
+        )
+    except Exception as error:
+        logger.exception(f"Error continuing Jev session {session.get('id')} run {task_id}")
+        _fail_task(task_id, user_id, str(error))
+
+
 async def _drain_session_queue(session_id: str, user_id: str):
     """Pop and run the next queued message, if the session is idle and has one.
 
@@ -2122,7 +2320,13 @@ async def _drain_session_queue(session_id: str, user_id: str):
     message = session["queue"].pop(0)
     task_id = str(uuid.uuid4())
     _new_task_record(
-        task_id, message["text"], session.get("ai_provider"), user_id, session_id=session_id
+        task_id,
+        message["text"],
+        session.get("ai_provider"),
+        user_id,
+        session_id=session_id,
+        navigator=session["navigator"],
+        extract=JEV_EXTRACT,
     )
     message["run_id"] = task_id
     session["status"] = "running"
@@ -2131,9 +2335,12 @@ async def _drain_session_queue(session_id: str, user_id: str):
     await _run_session_continuation(session_id, task_id, message["text"], user_id)
 
 
-async def _create_or_continue_session_run(session_id: str, task_text: str, user_id: str):
+async def _create_or_continue_session_run(
+    session_id: str, task_text: str, user_id: str, navigator: Optional[str] = None, extract: Optional[bool] = None
+):
     """POST /runs with a sessionId: start a brand-new session, or continue
     an idle one in its existing browser."""
+    extract = JEV_EXTRACT if extract is None else extract  # per run, like a follow-up's navigator
     session = _sessions.get(session_id)
 
     if session and session["status"] == "running":
@@ -2145,33 +2352,47 @@ async def _create_or_continue_session_run(session_id: str, task_text: str, user_
     if session is None:
         # Brand-new session: run normally (fresh browser); execute_task
         # will hand the browser off to the session registry when it's done.
+        navigator = navigator or DEFAULT_NAVIGATOR
         task_id = str(uuid.uuid4())
         _sessions[session_id] = {
             "id": session_id,
             "user_id": user_id,
             "ai_provider": None,
+            "navigator": navigator,
             "status": "running",
             "current_run_id": task_id,
             "latest_run_id": task_id,
             "first_run_id": task_id,
             "agent": None,
+            "browser_use_agent": None,
             "browser": None,
             "queue": [],
             "next_message_id": 1,
             "created_at": datetime.now(UTC).isoformat() + "Z",
         }
-        live_url = _new_task_record(task_id, task_text, None, user_id, session_id=session_id)
+        live_url = _new_task_record(
+            task_id, task_text, None, user_id, session_id=session_id, navigator=navigator, extract=extract
+        )
         ai_provider = os.environ.get("DEFAULT_AI_PROVIDER", "openai")
         _sessions[session_id]["ai_provider"] = ai_provider
         asyncio.create_task(
-            execute_task(task_id, task_text, ai_provider, user_id, session_id=session_id)
+            execute_task(
+                task_id, task_text, ai_provider, user_id, session_id=session_id, navigator=navigator
+            )
         )
         return _run_create_response(task_id, task_text, session_id)
 
     # Idle session: continue in the same browser instead of starting a new one.
+    # A follow-up may pick its own navigator (log in with browser-use, then navigate with Jev).
     task_id = str(uuid.uuid4())
     _new_task_record(
-        task_id, task_text, session.get("ai_provider"), user_id, session_id=session_id
+        task_id,
+        task_text,
+        session.get("ai_provider"),
+        user_id,
+        session_id=session_id,
+        navigator=navigator or session["navigator"],
+        extract=extract,
     )
     session["status"] = "running"
     session["current_run_id"] = task_id

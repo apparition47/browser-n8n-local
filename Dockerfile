@@ -42,6 +42,9 @@ RUN mkdir -p /app/media && chmod 777 /app/media
 # Expose the port the app runs on
 EXPOSE 8000
 
+# The image can't run Jev (Python 3.11, no ../jev-ultrafast checkout), so default to browser-use even without docker-compose
+ENV DEFAULT_NAVIGATOR=browser-use
+
 # Create a non-root user to run the app
 RUN adduser --disabled-password --gecos "" appuser
 # Give appuser permissions to the necessary directories
